@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Install (or with --uninstall, remove) Omatable as a desktop app for the current user.
+# --default-sqlite also makes it the default app for SQLite files.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,13 @@ gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 |
 echo "✔ App installed:           ~/.local/bin/omatable"
 echo "✔ Desktop entry installed: ~/.local/share/applications/omatable.desktop"
 
-# Open SQLite files with Omatable
+# Omatable is offered under "Open with" for SQLite files; it only becomes the
+# default app when asked to, so an existing choice is never overwritten
 update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
-xdg-mime default omatable.desktop application/vnd.sqlite3 application/x-sqlite3
-echo "✔ SQLite files (.db, .sqlite, .sqlite3) now open with Omatable"
+if [[ " $* " == *" --default-sqlite "* ]]; then
+  xdg-mime default omatable.desktop application/vnd.sqlite3 application/x-sqlite3
+  echo "✔ SQLite files (.db, .sqlite, .sqlite3) now open with Omatable by default"
+else
+  echo "✔ Omatable is available under \"Open with\" for SQLite files"
+  echo "  (run ./install.sh --default-sqlite to make it the default)"
+fi
