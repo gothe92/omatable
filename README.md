@@ -71,7 +71,7 @@ Launch Omatable with `SUPER + SPACE`, or choose it from "Open with" for SQLite f
 ./install.sh --default-sqlite
 ```
 
-Requires `python-pyqt6`. Browsing containers also requires Docker access.
+Requires `python-pyqt6`. Browsing containers also requires Docker, with your user in the `docker` group (Omarchy's Docker install does this for you).
 
 ## Usage
 

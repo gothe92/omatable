@@ -261,23 +261,13 @@ def is_write_query(engine: str, query: str) -> bool:
 
 class DockerDbBackend:
     def __init__(self):
-        self._use_sudo = False
-        self._detect_docker_access()
-
-    def _detect_docker_access(self):
-        try:
-            subprocess.check_output(["docker", "info"], stderr=subprocess.DEVNULL)
-            self._use_sudo = False
-        except Exception:
-            self._use_sudo = True
-
-    def _docker_cmd(self, args: List[str]) -> List[str]:
-        return (["sudo", "-n", "docker"] if self._use_sudo else ["docker"]) + args
+        # Why the last container scan failed (no Docker, no permission), shown in the UI
+        self.docker_error = ""
 
     def run_docker(self, args: List[str], timeout: int = 12) -> Tuple[int, str, str]:
         try:
             proc = subprocess.run(
-                self._docker_cmd(args),
+                ["docker"] + args,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -285,6 +275,8 @@ class DockerDbBackend:
             return proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired:
             return 124, "", "Command timed out"
+        except FileNotFoundError:
+            return 127, "", "Docker is not installed"
         except Exception as e:
             return 1, "", str(e)
 
@@ -353,7 +345,8 @@ class DockerDbBackend:
         return None
 
     def discover_containers(self) -> List[DockerDbContainer]:
-        rc, out, _ = self.run_docker(["ps", "-a", "-q"])
+        rc, out, err = self.run_docker(["ps", "-a", "-q"])
+        self.docker_error = "" if rc == 0 else (err.strip().splitlines() or ["Docker is not available"])[-1]
         if rc != 0 or not out.strip():
             return []
         ids = [line.strip() for line in out.splitlines() if line.strip()]
@@ -1047,7 +1040,7 @@ class DockerDbBackend:
                 stderr=subprocess.DEVNULL,
             )
             return
-        prefix = "sudo docker" if self._use_sudo else "docker"
+        prefix = "docker"
         target_db = db or c.default_db
         if c.engine in ("mysql", "mariadb"):
             bin_name = "mariadb" if c.engine == "mariadb" else "mysql"
@@ -1863,7 +1856,13 @@ class OmatableWindow(QMainWindow):
             else:
                 self.current_container = None
                 self._clear_tree()
-                self.status_bar.showMessage("No database containers")
+                err = self.backend.docker_error
+                if err:
+                    hint = " — add your user to the docker group" if "permission denied" in err.lower() else ""
+                    msg = err if err.startswith("Docker ") else f"Can't reach Docker: {err}"
+                    self.status_bar.showMessage(f"{msg}{hint}")
+                else:
+                    self.status_bar.showMessage("No database containers")
 
         self._run_async("Scanning Docker containers...", _task, _done, channel="containers")
 
