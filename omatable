@@ -744,7 +744,7 @@ class DockerDbBackend:
                 parsed = json.loads(out.strip().splitlines()[-1])
                 active_db = parsed.get("activeDb", "admin")
                 dbs = parsed.get("databases", ["admin"])
-                items = parsed.get("items", [])
+                items = sorted(parsed.get("items", []), key=lambda it: it.get("name", ""))
                 return (active_db, dbs, items, f"{len(items)} collections in `{active_db}`")
             except Exception as e:
                 return ("admin", ["admin"], [], str(e))
