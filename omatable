@@ -1217,9 +1217,12 @@ class OmatableWindow(QMainWindow):
         self._queries: Dict[str, str] = {}
         self._filter_expanded: List[Any] = []
         self._db_items: Dict[str, List[Dict[str, str]]] = {}
+        self._tree_gen = 0
+        self._reload_pending: set = set()
         self._grid_overview = ""
 
         self._req_counter = 0
+        self._channel_latest: Dict[str, int] = {}
         self._active_workers: Dict[int, AsyncDbWorker] = {}
         self._alive_threads: set = set()
         self._loading_label = ""
@@ -1746,17 +1749,21 @@ class OmatableWindow(QMainWindow):
             if self.status_bar.currentMessage()[:1] in self.SPINNER_FRAMES:
                 self.status_bar.clearMessage()
 
-    def _run_async(self, label: str, fn: Callable[[], Any], on_done: Callable[[Any], None], exclusive: bool = True,
-                   on_error: Optional[Callable[[str], None]] = None):
+    def _run_async(self, label: str, fn: Callable[[], Any], on_done: Callable[[Any], None],
+                   channel: Optional[str] = None, on_error: Optional[Callable[[str], None]] = None):
+        """Run fn off the UI thread. Within a channel only the newest request's result is
+        applied, so e.g. a slow table load can't overwrite a newer one; requests on
+        different channels (or with no channel) never cancel each other."""
         # In headless unit tests when window is not shown, run synchronously
         if not self.isVisible():
             self._set_loading(True, label)
             try:
                 res = fn()
             except Exception as exc:
-                if on_error:
-                    on_error(str(exc))
                 self._set_loading(False)
+                if on_error is None:
+                    raise
+                on_error(str(exc))
                 return
             try:
                 on_done(res)
@@ -1766,6 +1773,8 @@ class OmatableWindow(QMainWindow):
 
         self._req_counter += 1
         req_id = self._req_counter
+        if channel:
+            self._channel_latest[channel] = req_id
         self._set_loading(True, label)
 
         worker = AsyncDbWorker(req_id, fn, self)
@@ -1775,7 +1784,7 @@ class OmatableWindow(QMainWindow):
             self._active_workers.pop(r_id, None)
             self._set_loading(False)
             # Only apply if this is the latest request or no newer request superseded it
-            if not exclusive or r_id == self._req_counter:
+            if not channel or self._channel_latest.get(channel) == r_id:
                 try:
                     on_done(result)
                 except Exception as exc:
@@ -1786,7 +1795,10 @@ class OmatableWindow(QMainWindow):
             self._set_loading(False)
             self.status_bar.showMessage(f"Error: {err_msg}")
             if on_error:
-                on_error(err_msg)
+                try:
+                    on_error(err_msg)
+                except Exception as exc:
+                    self.status_bar.showMessage(f"Error: {exc}")
 
         def _handle_finished():
             # Only release the QThread once run() has fully returned; deleting it
@@ -1850,10 +1862,10 @@ class OmatableWindow(QMainWindow):
                 self.on_container_selected(selected_idx)
             else:
                 self.current_container = None
-                self.schema_tree.clear()
+                self._clear_tree()
                 self.status_bar.showMessage("No database containers")
 
-        self._run_async("Scanning Docker containers...", _task, _done)
+        self._run_async("Scanning Docker containers...", _task, _done, channel="containers")
 
     def on_container_selected(self, row: int):
         if row < 0 or row >= len(self.containers):
@@ -1877,13 +1889,13 @@ class OmatableWindow(QMainWindow):
         self.tabs.setTabVisible(1, has_structure)
 
         if not c.running:
-            self.schema_tree.clear()
+            self._clear_tree()
             self._clear_grids()
             self.status_bar.showMessage(f"{c.name} is stopped")
             return
 
         self.schema_tree.blockSignals(True)
-        self.schema_tree.clear()
+        self._clear_tree()
         self.schema_tree.blockSignals(False)
 
         def _task():
@@ -1898,7 +1910,7 @@ class OmatableWindow(QMainWindow):
             self._build_schema_tree(c, dbs, active_db, items)
             self.status_bar.showMessage(f"Connected to {c.name}  •  {summary}  •  {c.connection_url}")
 
-        self._run_async(f"Connecting to {c.name} ({c.engine_label})...", _task, _done)
+        self._run_async(f"Connecting to {c.name} ({c.engine_label})...", _task, _done, channel="schema")
 
     # -----------------------------------------------------------------------
     # Schema tree: databases → tables / keys / collections
@@ -1913,6 +1925,13 @@ class OmatableWindow(QMainWindow):
         return node
 
     def _fill_db_node(self, node: QTreeWidgetItem, db: str, items: List[Dict[str, str]]):
+        tree = self.schema_tree
+        cur = tree.currentItem()
+        selected = None
+        if cur is not None and cur.parent() is node:
+            selected = (cur.data(0, self._ROLE) or ("", "", ""))[2]
+        # Rebuilding children must not bounce the selection around
+        was_blocked = tree.blockSignals(True)
         node.takeChildren()
         for it in items:
             node.addChild(self._table_node(db, it))
@@ -1923,7 +1942,15 @@ class OmatableWindow(QMainWindow):
             node.addChild(empty)
         node.setData(0, self._ROLE, ("db", db, "loaded"))
         self._db_items[db] = items
-        if self.schema_tree.currentItem() is node:
+        again = next((node.child(i) for i in range(node.childCount())
+                      if selected and (node.child(i).data(0, self._ROLE) or ("", "", ""))[2] == selected), None)
+        if selected is not None:
+            tree.setCurrentItem(again or node)
+        tree.blockSignals(was_blocked)
+        if again is not None:
+            if self.current_table == selected and self.current_db == db:
+                self._table_load_timer.start()  # show the table's fresh rows
+        elif tree.currentItem() is node:
             self._show_db_overview(db)
 
     def _set_grid(self, headers: List[str], rows: List[List[str]], overview: str = ""):
@@ -1969,7 +1996,7 @@ class OmatableWindow(QMainWindow):
         rows = []
         for it in items:
             count = it.get("count", "")
-            m = re.match(r"\s*(-?[\d.]+(?:[eE][+-]?\d+)?)\b", count)
+            m = re.match(r"\s*(-?\d[\d.]*(?:[eE][+-]?\d+)?)\b", count)
             rows.append([it.get("name", ""), m.group(1) if m else count, it.get("extra", "")])
         # Drop the third column when it says nothing (MongoDB's "collection", empty extras)
         if headers[2] == "Kind" or all(not r[2] for r in rows):
@@ -1980,21 +2007,82 @@ class OmatableWindow(QMainWindow):
         self.status_bar.showMessage(f"{c.name if c else ''} → {db}: {len(rows)} {what}")
 
     def refresh_database(self, db: str):
-        """Reload one database's table list in place (tree + overview)."""
-        self._db_items.pop(db, None)
+        """Reload one database's table list in place (tree + overview), keeping the selection."""
+        c = self.current_container
+        if c is None:
+            return
         tree = self.schema_tree
-        if self.current_container and self.current_container.engine == "sqlite":
-            # A local file lists instantly; rebuild its flat table list
-            c = self.current_container
-            active_db, dbs, items, _ = self.backend.list_databases_and_items(c)
-            self._build_schema_tree(c, dbs, active_db, items)
+        if c.engine == "sqlite":
+            self._refresh_sqlite_file(c)
             return
         for i in range(tree.topLevelItemCount()):
             top = tree.topLevelItem(i)
             data = top.data(0, self._ROLE) or ("", "", "")
-            if data[:2] == ("db", db):
+            if data[:2] != ("db", db):
+                continue
+            if data[2] == "loading":
+                self._reload_pending.add(db)  # reload once the running load lands
+            elif data[2] == "loaded":
                 top.setData(0, self._ROLE, ("db", db, ""))
                 self._load_db_node(top)
+
+    def _refresh_sqlite_file(self, c: DockerDbContainer):
+        gen = self._tree_gen
+        prev_table = self.current_table
+        prev_tab = self.tabs.currentIndex()
+
+        def _task():
+            return self.backend.list_databases_and_items(c)
+
+        def _done(res):
+            if self._tree_gen != gen or self.current_container is not c:
+                return
+            active_db, dbs, items, _ = res
+            self._build_schema_tree(c, dbs, active_db, items)
+            node = next((n for n in self._table_nodes() if n.data(0, self._ROLE)[2] == prev_table), None)
+            if prev_table and node is not None:
+                self.schema_tree.setCurrentItem(node)
+            self.tabs.setCurrentIndex(prev_tab)
+
+        self._run_async(f"Reloading {c.name}...", _task, _done)
+
+    def refresh_database_list(self):
+        """Add databases created and drop ones removed since the tree was built."""
+        c = self.current_container
+        if c is None or c.engine == "sqlite":
+            return
+        gen = self._tree_gen
+
+        def _task():
+            return self.backend.list_databases_and_items(c, self.current_db)
+
+        def _done(res):
+            if self._tree_gen != gen or self.current_container is not c:
+                return
+            dbs = res[1]
+            tree = self.schema_tree
+            existing = {}
+            for i in range(tree.topLevelItemCount()):
+                data = tree.topLevelItem(i).data(0, self._ROLE) or ("", "", "")
+                if data[0] == "db":
+                    existing[data[1]] = tree.topLevelItem(i)
+            for db, node in existing.items():
+                if db not in dbs:
+                    if tree.currentItem() in (node, *[node.child(j) for j in range(node.childCount())]):
+                        tree.setCurrentItem(None)
+                    self._db_items.pop(db, None)
+                    tree.takeTopLevelItem(tree.indexOfTopLevelItem(node))
+            for pos, db in enumerate(dbs):
+                if db not in existing:
+                    node = QTreeWidgetItem([f"󰆼  {db}"])
+                    node.setData(0, self._ROLE, ("db", db, ""))
+                    loading = QTreeWidgetItem(["…"])
+                    loading.setFlags(Qt.ItemFlag.NoItemFlags)
+                    node.addChild(loading)
+                    tree.insertTopLevelItem(min(pos, tree.topLevelItemCount()), node)
+            self.apply_tree_filter()
+
+        self._run_async(f"Reloading {c.name} databases...", _task, _done)
 
     def _open_from_overview(self, row: int):
         db = self._grid_overview
@@ -2017,12 +2105,18 @@ class OmatableWindow(QMainWindow):
         else:
             self.inspect_cell_dialog(row, col)
 
+    def _clear_tree(self):
+        # Any tree items async loads still hold become invalid from here on
+        self._tree_gen += 1
+        self.schema_tree.clear()
+
     def _build_schema_tree(self, c: DockerDbContainer, dbs: List[str], active_db: str, items: List[Dict[str, str]]):
         tree = self.schema_tree
         tree.blockSignals(True)
-        tree.clear()
+        self._clear_tree()
         self._filter_expanded = []
         self._db_items = {active_db: items}
+        self._reload_pending = set()
         self.current_table = ""
         self._clear_grids()
         if c.engine == "sqlite":
@@ -2056,23 +2150,34 @@ class OmatableWindow(QMainWindow):
             return
         c = self.current_container
         db = data[1]
+        gen = self._tree_gen
         node.setData(0, self._ROLE, ("db", db, "loading"))
 
         def _task():
             return self.backend.list_databases_and_items(c, db)
 
+        def _current() -> bool:
+            # The tree may have been rebuilt meanwhile; its old items are gone
+            return self._tree_gen == gen and self.current_container is c
+
         def _done(res):
-            if self.current_container is not c:
+            if not _current():
                 return
             self._fill_db_node(node, db, res[2])
             self.apply_tree_filter()
+            if db in self._reload_pending:
+                # A refresh was asked for while this load was already running
+                self._reload_pending.discard(db)
+                node.setData(0, self._ROLE, ("db", db, ""))
+                self._load_db_node(node)
 
         def _failed(_msg):
             # Let the next expand / click / filter try again
-            if self.current_container is c:
+            if _current():
+                self._reload_pending.discard(db)
                 node.setData(0, self._ROLE, ("db", db, ""))
 
-        self._run_async(f"Loading {c.name}/{db}...", _task, _done, exclusive=False, on_error=_failed)
+        self._run_async(f"Loading {c.name}/{db}...", _task, _done, on_error=_failed)
 
     def _table_nodes(self):
         tree = self.schema_tree
@@ -2277,7 +2382,7 @@ class OmatableWindow(QMainWindow):
                 f"{c.name} → {db_name}.{tbl_name}: loaded {len(rows)} row(s)"
             )
 
-        self._run_async(f"Loading {db_name}.{tbl_name} (limit {limit})...", _task, _done)
+        self._run_async(f"Loading {db_name}.{tbl_name} (limit {limit})...", _task, _done, channel="table")
 
     @staticmethod
     def _fill_table_widget(widget: QTableWidget, headers: List[str], rows: List[List[str]]):
@@ -2359,10 +2464,11 @@ class OmatableWindow(QMainWindow):
                 self.query_raw.setText(f"{len(rows)} row(s)  •  {elapsed}")
                 self.status_bar.clearMessage()
             if wrote and headers != ["Error"]:
-                # Tables may have been created, dropped or resized
+                # Tables (or whole databases) may have been created, dropped or resized
+                self.refresh_database_list()
                 self.refresh_database(db_name)
 
-        self._run_async(f"Executing query on {c.name}/{db_name}...", _task, _done)
+        self._run_async(f"Executing query on {c.name}/{db_name}...", _task, _done, channel="query")
 
     def _switcher_entries(self) -> List[Tuple[str, Any]]:
         entries: List[Tuple[str, Any]] = []
@@ -2479,7 +2585,7 @@ class OmatableWindow(QMainWindow):
                 QMessageBox.warning(self, "Docker Error", msg)
             self.refresh_containers()
 
-        self._run_async(f"{action} container {c.name}...", _task, _done)
+        self._run_async(f"{action} container {c.name}...", _task, _done, channel="toggle")
 
     def copy_connection_url(self):
         if not self.current_container:

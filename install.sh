@@ -9,7 +9,28 @@ DESKTOP="$HOME/.local/share/applications/omatable.desktop"
 ICON="$HOME/.local/share/icons/hicolor/scalable/apps/omatable.svg"
 MIMEAPPS="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+UNINSTALL=0
+DEFAULT_SQLITE=0
+for arg in "$@"; do
+  case "$arg" in
+    --uninstall) UNINSTALL=1 ;;
+    --default-sqlite) DEFAULT_SQLITE=1 ;;
+    -h|--help)
+      echo "Usage: ./install.sh [--default-sqlite] | --uninstall"
+      exit 0
+      ;;
+    *)
+      echo "install.sh: unknown option '$arg' (see --help)" >&2
+      exit 2
+      ;;
+  esac
+done
+if (( UNINSTALL && DEFAULT_SQLITE )); then
+  echo "install.sh: --uninstall and --default-sqlite can't be combined" >&2
+  exit 2
+fi
+
+if (( UNINSTALL )); then
   rm -f "$BIN" "$DESKTOP" "$ICON"
   # Drop only Omatable's own default-app entries
   [[ -f "$MIMEAPPS" ]] && sed -i '/^application\/\(vnd\.\|x-\)sqlite3=omatable\.desktop;\?$/d' "$MIMEAPPS"
@@ -30,7 +51,8 @@ echo "✔ Desktop entry installed: ~/.local/share/applications/omatable.desktop"
 # Omatable is offered under "Open with" for SQLite files; it only becomes the
 # default app when asked to, so an existing choice is never overwritten
 update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
-if [[ " $* " == *" --default-sqlite "* ]]; then
+if (( DEFAULT_SQLITE )); then
+  mkdir -p "$(dirname "$MIMEAPPS")"
   xdg-mime default omatable.desktop application/vnd.sqlite3 application/x-sqlite3
   echo "✔ SQLite files (.db, .sqlite, .sqlite3) now open with Omatable by default"
 else

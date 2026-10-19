@@ -49,6 +49,14 @@ Then bind it to a key in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + ALT + SHIFT + D", "Omatable", "omarchy-shell shell summon gothe92.omatable")
 ```
 
+The plugin opens Omatable through the shell. To open a SQLite file with it:
+
+```bash
+omarchy-shell shell summon gothe92.omatable '{"path": "/path/to/app.db"}'
+```
+
+Install the desktop app as well if you want the `omatable` command, a launcher entry and "Open with" for SQLite files.
+
 ### Desktop app
 
 ```bash
@@ -66,6 +74,8 @@ Launch Omatable with `SUPER + SPACE`, or choose it from "Open with" for SQLite f
 Requires `python-pyqt6`. Browsing containers also requires Docker access.
 
 ## Usage
+
+With the desktop app installed:
 
 ```bash
 omatable                    # browse your Docker databases
