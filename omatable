@@ -1901,10 +1901,8 @@ class OmatableWindow(QMainWindow):
     _ROLE = Qt.ItemDataRole.UserRole
 
     def _table_node(self, db: str, it: Dict[str, str]) -> QTreeWidgetItem:
-        cnt = it.get("count", "")
-        extra = it.get("extra", "")
-        meta = f"  ({cnt}{', ' + extra if extra else ''})" if cnt else ""
-        node = QTreeWidgetItem([f"󰓫  {it.get('name', '')}{meta}"])
+        # Counts and sizes live in the database overview, the tree stays just names
+        node = QTreeWidgetItem([f"󰓫  {it.get('name', '')}"])
         node.setData(0, self._ROLE, ("table", db, it.get("name", "")))
         return node
 
