@@ -111,6 +111,16 @@ omarchy plugin remove andras.omatable
 
 Uninstalling removes only the files Omatable installed and its own SQLite default-app entries. Your databases, containers and files are never touched.
 
+## Keyboard navigation
+
+You can do everything without the mouse:
+
+1. **Containers** have focus when Omatable opens. Type a few letters to jump to a container, then press `Enter` (or `→`).
+2. **Tables:** start typing to filter them; the filter fills in as you type. Use `↑` / `↓` to move and `Enter` (or `→`) to open the table in the Data tab.
+3. **Data grid:** `Esc` goes back to the tables. In the tables, `Esc` clears the filter first, and pressing it again goes back to the containers (`←` also works).
+
+Moving through tables with the arrow keys loads each one after a short pause, so holding a key down doesn't fire a query for every row.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |

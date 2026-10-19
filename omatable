@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -1122,6 +1122,13 @@ class OmatableWindow(QMainWindow):
         self._apply_stylesheet()
         self._build_ui()
         self._setup_shortcuts()
+        self._table_load_timer = QTimer(self)
+        self._table_load_timer.setSingleShot(True)
+        self._table_load_timer.setInterval(180)
+        self._table_load_timer.timeout.connect(self.reload_current_table)
+        for w in (self.container_list, self.items_list, self.table_filter, self.data_table):
+            w.installEventFilter(self)
+        self.container_list.setFocus()
         self._tune_scrolling()
 
         QTimer.singleShot(50, self.refresh_containers)
@@ -1774,7 +1781,82 @@ class OmatableWindow(QMainWindow):
             return
         item = self._filtered_items[row]
         self.current_table = item["name"]
-        self.reload_current_table()
+        # Wait for typing / arrow-key runs to settle before querying
+        self._table_load_timer.start()
+
+    # -----------------------------------------------------------------------
+    # Keyboard navigation: containers → tables (type to filter) → data grid
+    # -----------------------------------------------------------------------
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(obj, event)
+        key = event.key()
+        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        plain = mods in (Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.ShiftModifier)
+        enter = key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+
+        if obj is self.container_list:
+            if enter or key == Qt.Key.Key_Right:
+                self._focus_tables()
+                return True
+
+        elif obj is self.items_list:
+            if enter or key == Qt.Key.Key_Right:
+                self._open_selected_table()
+                return True
+            if key in (Qt.Key.Key_Escape, Qt.Key.Key_Left):
+                if self.table_filter.text():
+                    self.table_filter.clear()
+                elif not self.sqlite_path:
+                    self.container_list.setFocus()
+                return True
+            if key == Qt.Key.Key_Backspace:
+                self.table_filter.backspace()
+                return True
+            text = event.text()
+            if plain and text and text.isprintable() and not text.isspace() and text != "/":
+                self.table_filter.insert(text)
+                return True
+
+        elif obj is self.table_filter:
+            if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
+                self.items_list.setFocus()
+                return True
+            if enter:
+                self._open_selected_table()
+                return True
+            if key == Qt.Key.Key_Escape:
+                if self.table_filter.text():
+                    self.table_filter.clear()
+                else:
+                    self.items_list.setFocus()
+                return True
+
+        elif obj is self.data_table:
+            if key == Qt.Key.Key_Escape:
+                self.items_list.setFocus()
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def _focus_tables(self):
+        self.items_list.setFocus()
+        if self.items_list.currentRow() < 0 and getattr(self, "_filtered_items", None):
+            self.items_list.setCurrentRow(0)
+
+    def _open_selected_table(self):
+        if not getattr(self, "_filtered_items", None):
+            return
+        if self.items_list.currentRow() < 0:
+            self.items_list.setCurrentRow(0)
+        if self._table_load_timer.isActive():
+            self._table_load_timer.stop()
+            self.reload_current_table()
+        self.tabs.setCurrentIndex(0)
+        self.data_table.setFocus()
+        if self.data_table.rowCount() and self.data_table.currentRow() < 0:
+            self.data_table.setCurrentCell(0, 0)
 
     def reload_current_table(self):
         if not self.current_container or not self.current_table:
