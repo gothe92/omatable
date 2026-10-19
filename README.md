@@ -46,7 +46,7 @@ omarchy plugin add https://github.com/gothe92/omatable --enable
 Then bind it to a key in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + ALT + SHIFT + D", "Omatable", "omarchy-shell shell summon andras.omatable")
+o.bind("SUPER + ALT + SHIFT + D", "Omatable", "omarchy-shell shell summon gothe92.omatable")
 ```
 
 ### Desktop app
@@ -96,7 +96,7 @@ Each launch opens a new window, and Omatable stops running when you close it.
 
 ```bash
 ./install.sh --uninstall
-omarchy plugin remove andras.omatable
+omarchy plugin remove gothe92.omatable
 ```
 
 Your databases and containers are left untouched.

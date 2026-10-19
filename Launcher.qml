@@ -5,8 +5,8 @@ import QtQuick
 // loaded when summoned, starts a new Omatable window, and dismisses itself, so
 // nothing from the plugin stays running in the background.
 //
-//   omarchy-shell shell summon andras.omatable
-//   omarchy-shell shell summon andras.omatable '{"path": "/path/to/file.sqlite"}'
+//   omarchy-shell shell summon gothe92.omatable
+//   omarchy-shell shell summon gothe92.omatable '{"path": "/path/to/file.sqlite"}'
 Item {
   id: root
 
@@ -31,6 +31,6 @@ Item {
 
   function dismiss() {
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "andras.omatable")
+      root.shell.hide((root.manifest && root.manifest.id) || "gothe92.omatable")
   }
 }
