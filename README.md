@@ -7,7 +7,7 @@ Browse and query the databases in your Docker containers, plus any SQLite file, 
 ## Features
 
 - **Zero setup.** Omatable finds every PostgreSQL, MySQL, MariaDB, SQL Server, MongoDB and Redis container on your machine, including ones started with `docker compose` or `omarchy-install-docker-dbs`. It reads ports and credentials from the container itself. No connection strings to type, no database clients to install.
-- **Everything in one tree.** Each container lists its databases, and each database opens to show its tables, collections or keys. The filter searches across all of them at once.
+- **Everything in one tree.** Each container lists its databases, and each database opens to show its tables, collections or keys. Select a database to get an overview of its tables with row counts and sizes, then open one with `Enter` or a double-click. The filter searches across all of them at once.
 - **A data grid that keeps up.** Sort any column, search through the loaded rows, inspect long or JSON values in a cell, and copy results as JSON or CSV.
 - **Query console.** Write SQL, `mongosh` or `redis-cli` commands and see the results right away, with the row count and timing. Every container remembers its own query.
 - **Safe by default.** Before a query that inserts, updates, deletes, creates or drops anything, Omatable shows it to you once more and asks for confirmation.

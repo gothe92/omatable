@@ -1216,6 +1216,8 @@ class OmatableWindow(QMainWindow):
         self.sqlite_path = sqlite_path
         self._queries: Dict[str, str] = {}
         self._filter_expanded: List[Any] = []
+        self._db_items: Dict[str, List[Dict[str, str]]] = {}
+        self._grid_overview = ""
 
         self._req_counter = 0
         self._active_workers: Dict[int, AsyncDbWorker] = {}
@@ -1623,7 +1625,7 @@ class OmatableWindow(QMainWindow):
         self.data_table = QTableWidget()
         self.data_table.setAlternatingRowColors(True)
         self.data_table.setSortingEnabled(True)
-        self.data_table.cellDoubleClicked.connect(self.inspect_cell_dialog)
+        self.data_table.cellDoubleClicked.connect(self._on_grid_double_click)
         td_layout.addWidget(self.data_table)
 
         self.tabs.addTab(tab_data, "󰓫  Data")
@@ -1916,12 +1918,82 @@ class OmatableWindow(QMainWindow):
             empty.setData(0, self._ROLE, ("empty", db, ""))
             node.addChild(empty)
         node.setData(0, self._ROLE, ("db", db, "loaded"))
+        self._db_items[db] = items
+        if self.schema_tree.currentItem() is node:
+            self._show_db_overview(db)
+
+    def _overview_headers(self) -> List[str]:
+        engine = self.current_container.engine if self.current_container else ""
+        if engine == "redis":
+            return ["Key", "Type", "TTL"]
+        if engine == "mongodb":
+            return ["Collection", "Documents", "Kind"]
+        return ["Table", "Rows", "Size"]
+
+    def _show_db_overview(self, db: str):
+        """List a database's tables in the data grid; open one with Enter or double-click."""
+        items = self._db_items.get(db)
+        self.current_db = db
+        self.current_table = ""
+        self._table_load_timer.stop()
+        self._grid_overview = db
+        for grid in (self.struct_table,):
+            grid.setRowCount(0)
+            grid.setColumnCount(0)
+        if items is None:
+            self._fill_table_widget(self.data_table, [], [])
+            # Not loaded yet: fetch it; _fill_db_node shows the list when it arrives
+            tree = self.schema_tree
+            for i in range(tree.topLevelItemCount()):
+                top = tree.topLevelItem(i)
+                if (top.data(0, self._ROLE) or ("", ""))[:2] == ("db", db):
+                    self._load_db_node(top)
+            return
+        headers = self._overview_headers()
+        rows = []
+        for it in items:
+            count = it.get("count", "")
+            num = count.split()[0] if count and count.split()[0].replace(".", "").isdigit() else count
+            rows.append([it.get("name", ""), num, it.get("extra", "")])
+        # Drop the third column when it says nothing (MongoDB's "collection", empty extras)
+        if headers[2] == "Kind" or all(not r[2] for r in rows):
+            headers, rows = headers[:2], [r[:2] for r in rows]
+        self.current_headers = headers
+        self.current_rows = rows
+        self._fill_table_widget(self.data_table, headers, rows)
+        self.filter_loaded_rows()
+        c = self.current_container
+        what = "collections" if headers[0] == "Collection" else "keys" if headers[0] == "Key" else "tables"
+        self.status_bar.showMessage(f"{c.name if c else ''} → {db}: {len(rows)} {what}")
+
+    def _open_from_overview(self, row: int):
+        db = self._grid_overview
+        item = self.data_table.item(row, 0)
+        if not db or item is None:
+            return
+        name = item.text()
+        for node in self._table_nodes():
+            d = node.data(0, self._ROLE)
+            if d[1] == db and d[2] == name:
+                if node.parent():
+                    node.parent().setExpanded(True)
+                self.schema_tree.setCurrentItem(node)
+                self._open_selected_table()
+                return
+
+    def _on_grid_double_click(self, row: int, col: int):
+        if self._grid_overview:
+            self._open_from_overview(row)
+        else:
+            self.inspect_cell_dialog(row, col)
 
     def _build_schema_tree(self, c: DockerDbContainer, dbs: List[str], active_db: str, items: List[Dict[str, str]]):
         tree = self.schema_tree
         tree.blockSignals(True)
         tree.clear()
         self._filter_expanded = []
+        self._db_items = {active_db: items}
+        self._grid_overview = ""
         self.current_table = ""
         for grid in (self.data_table, self.struct_table):
             grid.setRowCount(0)
@@ -1945,6 +2017,8 @@ class OmatableWindow(QMainWindow):
                     node.setExpanded(True)
         tree.blockSignals(False)
         self.apply_tree_filter()
+        if c.engine == "sqlite":
+            self._show_db_overview(active_db)
 
     def on_tree_expanded(self, node: QTreeWidgetItem):
         self._load_db_node(node)
@@ -2030,6 +2104,7 @@ class OmatableWindow(QMainWindow):
                     tree.blockSignals(True)
                     tree.setCurrentItem(top)
                     tree.blockSignals(False)
+                    self._show_db_overview(top.data(0, self._ROLE)[1])
                     break
 
     def on_tree_current_changed(self, cur: QTreeWidgetItem, _prev=None):
@@ -2040,12 +2115,13 @@ class OmatableWindow(QMainWindow):
             return
         kind, db, name = data
         if kind == "db":
-            self.current_db = db
+            self._show_db_overview(db)
             return
         if kind != "table":
             return
         self.current_db = db
         self.current_table = name
+        self._grid_overview = ""
         # Wait for typing / arrow-key runs to settle before querying
         self._table_load_timer.start()
 
@@ -2108,6 +2184,9 @@ class OmatableWindow(QMainWindow):
                 return True
 
         elif obj is self.data_table:
+            if enter and self._grid_overview:
+                self._open_from_overview(max(self.data_table.currentRow(), 0))
+                return True
             if key == Qt.Key.Key_Escape:
                 self.schema_tree.setFocus()
                 return True
@@ -2150,6 +2229,8 @@ class OmatableWindow(QMainWindow):
             return headers, rows, s_headers, s_rows
 
         def _done(res):
+            if self.current_table != tbl_name or self.current_container is not c:
+                return  # the user moved on while this was loading
             headers, rows, s_headers, s_rows = res
             self.current_headers = headers
             self.current_rows = rows

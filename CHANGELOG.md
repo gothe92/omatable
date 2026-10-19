@@ -6,7 +6,7 @@ First release.
 
 - Finds PostgreSQL, MySQL, MariaDB, SQL Server, MongoDB and Redis containers automatically, credentials included.
 - Opens SQLite files, and can be set as the default app for them.
-- Database tree with a filter that searches across every database in a container.
+- Database tree with a filter that searches across every database in a container, and a table overview for each database.
 - Data grid with sorting, row search, cell inspector, and JSON / CSV copy.
 - Query console with per-container history, row counts and timing.
 - Asks for confirmation before any query that changes data.
