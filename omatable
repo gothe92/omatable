@@ -1922,6 +1922,10 @@ class OmatableWindow(QMainWindow):
         tree.blockSignals(True)
         tree.clear()
         self._filter_expanded = []
+        self.current_table = ""
+        for grid in (self.data_table, self.struct_table):
+            grid.setRowCount(0)
+            grid.setColumnCount(0)
         if c.engine == "sqlite":
             # One file is one database: list its tables directly
             for it in items:
@@ -2013,15 +2017,20 @@ class OmatableWindow(QMainWindow):
 
         cur = tree.currentItem()
         cur_kind = (cur.data(0, self._ROLE) or ("",))[0] if cur else ""
-        if cur is None or cur.isHidden() or (cur.parent() and cur.parent().isHidden()) or (flt and cur_kind != "table"):
+        if flt and (cur is None or cur.isHidden() or (cur.parent() and cur.parent().isHidden()) or cur_kind != "table"):
+            # While filtering, highlight the first match so Enter opens it
             first = next((n for n in self._table_nodes() if not n.isHidden() and not (n.parent() and n.parent().isHidden())), None)
             if first is not None:
                 tree.setCurrentItem(first)
-            elif cur is None:
-                self.data_table.setRowCount(0)
-                self.data_table.setColumnCount(0)
-                self.struct_table.setRowCount(0)
-                self.struct_table.setColumnCount(0)
+        elif not flt and (cur is None or cur.isHidden()):
+            # Otherwise just point at the open database; no table is loaded until chosen
+            for i in range(tree.topLevelItemCount()):
+                top = tree.topLevelItem(i)
+                if (top.data(0, self._ROLE) or ("",))[0] == "db" and top.isExpanded():
+                    tree.blockSignals(True)
+                    tree.setCurrentItem(top)
+                    tree.blockSignals(False)
+                    break
 
     def on_tree_current_changed(self, cur: QTreeWidgetItem, _prev=None):
         if cur is None:
