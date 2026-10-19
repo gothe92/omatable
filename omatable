@@ -1,0 +1,2052 @@
+#!/usr/bin/env python3
+"""
+Omatable
+Standalone database browser for Omarchy Linux.
+Automatically discovers all database containers in Docker (Compose & standalone),
+extracts credentials/ports from container metadata, and connects via `docker exec`
+with zero host client dependencies.
+"""
+
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QKeySequence, QShortcut
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+# ---------------------------------------------------------------------------
+# Omarchy Theme Loader
+# ---------------------------------------------------------------------------
+
+def load_omarchy_theme() -> Dict[str, str]:
+    palette = {
+        "background": "#1a1b26",
+        "dark_background": "#16161e",
+        "darker_background": "#101014",
+        "lighter_background": "#24283b",
+        "foreground": "#c0caf5",
+        "dark_foreground": "#565f89",
+        "bright_foreground": "#ffffff",
+        "selection_background": "#33467c",
+        "selection_foreground": "#c0caf5",
+        "blue": "#7aa2f7",
+        "cyan": "#7dcfff",
+        "green": "#9ece6a",
+        "yellow": "#e0af68",
+        "red": "#f7768e",
+        "magenta": "#bb9af7",
+        "muted": "#565f89",
+    }
+    try:
+        out = subprocess.check_output(
+            ["omarchy-theme-color", "--all"], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            if "\t" in line:
+                k, v = line.split("\t", 1)
+                if v.startswith("#"):
+                    palette[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return palette
+
+
+def load_omarchy_font() -> str:
+    try:
+        out = subprocess.check_output(
+            ["omarchy-font-current"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    return "JetBrainsMono Nerd Font"
+
+
+# ---------------------------------------------------------------------------
+# Docker Database Auto-Discovery & Execution Engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DockerDbContainer:
+    container_id: str
+    name: str
+    image: str
+    engine: str  # postgres | mysql | mariadb | redis | mongodb | mssql
+    running: bool
+    status_text: str
+    compose_project: str = ""
+    compose_service: str = ""
+    host_port: str = ""
+    container_port: str = ""
+    user: str = ""
+    password: str = ""
+    default_db: str = ""
+    env: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def engine_label(self) -> str:
+        labels = {
+            "postgres": "PostgreSQL",
+            "mysql": "MySQL",
+            "mariadb": "MariaDB",
+            "redis": "Redis",
+            "mongodb": "MongoDB",
+            "mssql": "MSSQL",
+            "sqlite": "SQLite",
+        }
+        return labels.get(self.engine, self.engine.upper())
+
+    @property
+    def version(self) -> str:
+        if self.engine == "sqlite":
+            return sqlite3.sqlite_version
+        env_keys = {
+            "postgres": "PG_VERSION",
+            "mysql": "MYSQL_VERSION",
+            "mariadb": "MARIADB_VERSION",
+            "redis": "REDIS_VERSION",
+            "mongodb": "MONGO_VERSION",
+            "mssql": "MSSQL_VERSION",
+        }
+        v = self.env.get(env_keys.get(self.engine, ""), "")
+        if v:
+            # Strip distro suffixes like "18.0-1.pgdg13+1" or "1:11.8.2+maria~ubu2404"
+            v = re.sub(r"^\d+:", "", v)
+            return re.split(r"[-+~]", v)[0]
+        tag = self.image.rsplit("/", 1)[-1]
+        if ":" in tag:
+            tag = tag.split(":", 1)[1].split("@")[0]
+            return "" if tag == "latest" else tag.split("-")[0]
+        return ""
+
+    @property
+    def engine_badge(self) -> str:
+        badges = {
+            "postgres": "🐘 PG",
+            "mysql": "🐬 MySQL",
+            "mariadb": "🦭 MariaDB",
+            "redis": "⚡ Redis",
+            "mongodb": "🍃 Mongo",
+            "mssql": "🗄️ MSSQL",
+        }
+        return badges.get(self.engine, "🗄️ DB")
+
+    @property
+    def connection_url(self) -> str:
+        if self.engine == "sqlite":
+            return f"sqlite:///{self.default_db}"
+        port = self.host_port or self.container_port
+        host = "127.0.0.1" if self.host_port else f"{self.name} (docker internal)"
+        auth = ""
+        if self.user and self.password:
+            auth = f"{self.user}:{self.password}@"
+        elif self.user:
+            auth = f"{self.user}@"
+        elif self.password:
+            auth = f":{self.password}@"
+
+        if self.engine == "postgres":
+            return f"postgresql://{auth}{host}:{port}/{self.default_db or 'postgres'}"
+        if self.engine in ("mysql", "mariadb"):
+            return f"mysql://{auth}{host}:{port}/{self.default_db or ''}"
+        if self.engine == "redis":
+            return f"redis://{auth}{host}:{port}/{self.default_db or '0'}"
+        if self.engine == "mongodb":
+            return f"mongodb://{auth}{host}:{port}/{self.default_db or 'admin'}?authSource=admin"
+        if self.engine == "mssql":
+            return f"sqlserver://{auth}{host}:{port}?database={self.default_db or 'master'}"
+        return f"{self.engine}://{host}:{port}"
+
+
+# Data-changing SQL keywords that are never ordinary identifiers or functions
+_SQL_WRITE_ANYWHERE_RE = re.compile(
+    r"\b(insert|update|delete|merge|upsert|create|alter|drop|truncate|grant|revoke)\b", re.IGNORECASE
+)
+# Keywords that only mean a write when they start a statement (REPLACE() and COMMENT are also names)
+_SQL_WRITE_LEADING = {
+    "replace", "rename", "copy", "vacuum", "reindex", "cluster", "comment", "attach", "detach",
+    "exec", "execute", "call", "load", "import", "commit", "restore", "backup", "dbcc", "optimize", "repair",
+}
+_REDIS_READ_COMMANDS = {
+    "get", "mget", "strlen", "getrange", "exists", "type", "ttl", "pttl", "keys", "scan",
+    "dbsize", "info", "ping", "echo", "time", "lastsave", "hget", "hmget", "hgetall", "hkeys",
+    "hvals", "hlen", "hexists", "hscan", "hstrlen", "lrange", "llen", "lindex", "lpos",
+    "smembers", "scard", "sismember", "smismember", "srandmember", "sscan", "sinter", "sunion",
+    "sdiff", "zrange", "zrangebyscore", "zrevrange", "zrevrangebyscore", "zcard", "zcount",
+    "zscore", "zrank", "zrevrank", "zscan", "zmscore", "xrange", "xrevrange", "xlen", "xinfo",
+    "pfcount", "getbit", "bitcount", "bitpos", "object", "memory", "dump", "randomkey",
+    "client", "config", "slowlog", "command", "role", "dbsize", "geopos", "geodist", "geosearch",
+}
+_MONGO_WRITE_RE = re.compile(
+    r"\.(insert\w*|update\w*|delete\w*|remove|drop\w*|create\w*|replace\w*|rename\w*|"
+    r"bulkWrite|findOneAnd\w+|findAndModify|save|runCommand|adminCommand)\s*\("
+)
+
+
+def is_write_query(engine: str, query: str) -> bool:
+    """True when a query may create, change or delete anything (asks for confirmation)."""
+    if engine == "redis":
+        words = query.strip().split()
+        return bool(words) and words[0].lower() not in _REDIS_READ_COMMANDS
+    if engine == "mongodb":
+        return bool(_MONGO_WRITE_RE.search(query) or re.search(r"\$(out|merge)\b", query))
+    # SQL: drop string literals, quoted identifiers and comments before looking for keywords
+    stripped = re.sub(r"'(?:[^']|'')*'", "''", query)
+    stripped = re.sub(r'"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]', "x", stripped)
+    stripped = re.sub(r"--[^\n]*|/\*.*?\*/", " ", stripped, flags=re.S)
+    if _SQL_WRITE_ANYWHERE_RE.search(stripped):
+        return True
+    for stmt in stripped.split(";"):
+        words = re.findall(r"[A-Za-z_]+", stmt)
+        if not words:
+            continue
+        first = words[0].lower()
+        if first in _SQL_WRITE_LEADING:
+            return True
+        if first == "pragma" and "=" in stmt:
+            return True
+        if first == "select" and re.search(r"\binto\b", stmt, re.IGNORECASE):
+            return True  # SELECT ... INTO creates a table / writes a file
+    return False
+
+
+class DockerDbBackend:
+    def __init__(self):
+        self._use_sudo = False
+        self._detect_docker_access()
+
+    def _detect_docker_access(self):
+        try:
+            subprocess.check_output(["docker", "info"], stderr=subprocess.DEVNULL)
+            self._use_sudo = False
+        except Exception:
+            self._use_sudo = True
+
+    def _docker_cmd(self, args: List[str]) -> List[str]:
+        return (["sudo", "-n", "docker"] if self._use_sudo else ["docker"]) + args
+
+    def run_docker(self, args: List[str], timeout: int = 12) -> Tuple[int, str, str]:
+        try:
+            proc = subprocess.run(
+                self._docker_cmd(args),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return proc.returncode, proc.stdout, proc.stderr
+        except subprocess.TimeoutExpired:
+            return 124, "", "Command timed out"
+        except Exception as e:
+            return 1, "", str(e)
+
+    @staticmethod
+    def _detect_engine(
+        image: str,
+        name: str,
+        env_map: Dict[str, str],
+        ports: Dict,
+        cmd_str: str = "",
+    ) -> Optional[str]:
+        img = image.lower()
+        nm = name.lower()
+        cmd = cmd_str.lower()
+        port_keys = " ".join((ports or {}).keys())
+
+        # 1. Image name or server binary in entrypoint/cmd or server-only version env
+        if (
+            any(k in img for k in ("postgres", "postgis", "pgvector", "timescale"))
+            or "PG_MAJOR" in env_map
+            or "postgres" in cmd
+            or ("5432/tcp" in port_keys and ("POSTGRES_PASSWORD" in env_map or "POSTGRES_HOST_AUTH_METHOD" in env_map))
+        ):
+            return "postgres"
+
+        if (
+            "mariadb" in img
+            or "MARIADB_MAJOR" in env_map
+            or "mariadbd" in cmd
+            or ("3306/tcp" in port_keys and ("MARIADB_ROOT_PASSWORD" in env_map or "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD" in env_map))
+        ):
+            return "mariadb"
+
+        if (
+            any(k in img for k in ("mysql", "percona"))
+            or "MYSQL_MAJOR" in env_map
+            or "mysqld" in cmd
+            or ("3306/tcp" in port_keys and ("MYSQL_ROOT_PASSWORD" in env_map or "MYSQL_ALLOW_EMPTY_PASSWORD" in env_map))
+        ):
+            return "mysql"
+
+        if (
+            any(k in img for k in ("redis", "valkey", "dragonfly", "keydb"))
+            or "REDIS_VERSION" in env_map
+            or "redis-server" in cmd
+            or "valkey-server" in cmd
+            or ("6379/tcp" in port_keys and ("redis" in nm or "valkey" in nm))
+        ):
+            return "redis"
+
+        if (
+            "mongo" in img
+            or "MONGO_MAJOR" in env_map
+            or "mongod" in cmd
+            or ("27017/tcp" in port_keys and "MONGO_INITDB_ROOT_USERNAME" in env_map)
+        ):
+            return "mongodb"
+
+        if (
+            any(k in img for k in ("mssql", "sqlserver"))
+            or "sqlservr" in cmd
+            or ("1433/tcp" in port_keys and ("MSSQL_SA_PASSWORD" in env_map or "ACCEPT_EULA" in env_map))
+        ):
+            return "mssql"
+
+        return None
+
+    def discover_containers(self) -> List[DockerDbContainer]:
+        rc, out, _ = self.run_docker(["ps", "-a", "-q"])
+        if rc != 0 or not out.strip():
+            return []
+        ids = [line.strip() for line in out.splitlines() if line.strip()]
+        if not ids:
+            return []
+
+        rc, inspect_out, _ = self.run_docker(["inspect"] + ids)
+        if rc != 0:
+            return []
+
+        try:
+            raw_list = json.loads(inspect_out)
+        except Exception:
+            return []
+
+        discovered: List[DockerDbContainer] = []
+        for item in raw_list:
+            cid = str(item.get("Id", ""))[:12]
+            name = str(item.get("Name", "")).lstrip("/")
+            config = item.get("Config") or {}
+            state = item.get("State") or {}
+            net = item.get("NetworkSettings") or {}
+
+            image = str(config.get("Image") or "")
+            labels = config.get("Labels") or {}
+            env_list = config.get("Env") or []
+            env_map: Dict[str, str] = {}
+            for entry in env_list:
+                if "=" in entry:
+                    k, v = entry.split("=", 1)
+                    env_map[k] = v
+
+            ports = net.get("Ports") or (config.get("ExposedPorts") or {})
+            cmd_parts = [str(item.get("Path") or "")] + [str(x) for x in (config.get("Entrypoint") or [])] + [str(x) for x in (config.get("Cmd") or [])]
+            engine = self._detect_engine(image, name, env_map, ports, " ".join(cmd_parts))
+            if not engine:
+                continue
+
+            running = bool(state.get("Running", False))
+            status_str = "Running" if running else str(state.get("Status") or "stopped").capitalize()
+            health = (state.get("Health") or {}).get("Status")
+            if running and health:
+                status_str = f"Running ({health})"
+
+            # Extract port mapping
+            default_ports = {
+                "postgres": "5432",
+                "mysql": "3306",
+                "mariadb": "3306",
+                "redis": "6379",
+                "mongodb": "27017",
+                "mssql": "1433",
+            }
+            c_port = default_ports.get(engine, "")
+            h_port = ""
+            net_ports = net.get("Ports") or {}
+            for pk, bindings in net_ports.items():
+                if bindings and isinstance(bindings, list) and len(bindings) > 0:
+                    hp = bindings[0].get("HostPort")
+                    if hp:
+                        h_port = str(hp)
+                        c_port = pk.split("/")[0]
+                        break
+
+            # Extract credentials & default database from container Env
+            user = ""
+            password = ""
+            default_db = ""
+
+            if engine == "postgres":
+                user = env_map.get("POSTGRES_USER", "postgres")
+                password = env_map.get("POSTGRES_PASSWORD", "")
+                default_db = env_map.get("POSTGRES_DB", user or "postgres")
+            elif engine in ("mysql", "mariadb"):
+                root_pw = env_map.get("MYSQL_ROOT_PASSWORD") or env_map.get("MARIADB_ROOT_PASSWORD") or ""
+                app_user = env_map.get("MYSQL_USER") or env_map.get("MARIADB_USER") or ""
+                app_pw = env_map.get("MYSQL_PASSWORD") or env_map.get("MARIADB_PASSWORD") or ""
+                if root_pw:
+                    user = "root"
+                    password = root_pw
+                elif env_map.get("MYSQL_ALLOW_EMPTY_PASSWORD") in ("true", "1", "yes") or env_map.get("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD") in ("true", "1", "yes") or not app_user:
+                    user = "root"
+                    password = ""
+                else:
+                    user = app_user
+                    password = app_pw
+                default_db = env_map.get("MYSQL_DATABASE") or env_map.get("MARIADB_DATABASE") or ""
+            elif engine == "redis":
+                password = env_map.get("REDIS_PASSWORD", "")
+                # Also check Cmd/Args for --requirepass literal
+                cmd_joined = " ".join((config.get("Cmd") or []) + (item.get("Args") or []))
+                if not password and "--requirepass" in cmd_joined:
+                    m = re.search(r"--requirepass\s+([^\s\"']+)", cmd_joined)
+                    if m and not m.group(1).startswith("$"):
+                        password = m.group(1)
+                default_db = "0"
+            elif engine == "mongodb":
+                user = env_map.get("MONGO_INITDB_ROOT_USERNAME", "")
+                password = env_map.get("MONGO_INITDB_ROOT_PASSWORD", "")
+                default_db = env_map.get("MONGO_INITDB_DATABASE", "admin")
+            elif engine == "mssql":
+                user = "sa"
+                password = env_map.get("MSSQL_SA_PASSWORD") or env_map.get("SA_PASSWORD") or "@dmin123"
+                default_db = "master"
+
+            discovered.append(
+                DockerDbContainer(
+                    container_id=cid,
+                    name=name,
+                    image=image,
+                    engine=engine,
+                    running=running,
+                    status_text=status_str,
+                    compose_project=str(labels.get("com.docker.compose.project") or ""),
+                    compose_service=str(labels.get("com.docker.compose.service") or ""),
+                    host_port=h_port,
+                    container_port=c_port,
+                    user=user,
+                    password=password,
+                    default_db=default_db,
+                    env=env_map,
+                )
+            )
+
+        # Sort running first, then by name
+        discovered.sort(key=lambda c: (0 if c.running else 1, c.name.lower()))
+        return discovered
+
+    # -- SQLite files (opened directly, no Docker involved) -------------------
+
+    @staticmethod
+    def sqlite_file(path: str) -> DockerDbContainer:
+        path = os.path.abspath(path)
+        return DockerDbContainer(
+            container_id="", name=os.path.basename(path), image="", engine="sqlite",
+            running=True, status_text="File", default_db=path,
+        )
+
+    @staticmethod
+    def _sqlite_cell(v: Any) -> str:
+        if v is None:
+            return "NULL"
+        if isinstance(v, bytes):
+            return f"<BLOB {len(v)} bytes>"
+        return str(v)
+
+    @staticmethod
+    def _sqlite_ident(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    def _sqlite_list(self, c: DockerDbContainer) -> Tuple[str, List[str], List[Dict[str, str]], str]:
+        try:
+            with sqlite3.connect(c.default_db) as conn:
+                objs = conn.execute(
+                    "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') "
+                    "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
+                items = []
+                for name, kind in objs:
+                    try:
+                        n = conn.execute(f"SELECT COUNT(*) FROM {self._sqlite_ident(name)}").fetchone()[0]
+                    except sqlite3.Error:
+                        n = "?"
+                    items.append({"name": name, "count": f"{n} rows", "extra": "view" if kind == "view" else ""})
+        except sqlite3.Error as e:
+            return (c.name, [c.name], [], f"SQLite error: {e}")
+        return (c.name, [c.name], items, f"{len(items)} tables in `{c.name}`")
+
+    def _sqlite_run(self, c: DockerDbContainer, sql: str, params: Tuple = ()) -> Tuple[List[str], List[List[str]], str]:
+        conn = sqlite3.connect(c.default_db)
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, params)
+            except sqlite3.ProgrammingError as e:
+                if "one statement" not in str(e):
+                    raise
+                cur.executescript(sql)
+            if cur.description:
+                headers = [d[0] for d in cur.description]
+                rows = [[self._sqlite_cell(v) for v in r] for r in cur.fetchall()]
+                return (headers, rows, "")
+            conn.commit()
+            affected = cur.rowcount if cur.rowcount >= 0 else 0
+            return (["Status"], [[f"OK, {affected} row(s) affected"]], f"{affected} row(s) affected")
+        finally:
+            conn.close()
+
+    def toggle_container(self, c: DockerDbContainer) -> Tuple[bool, str]:
+        if c.engine == "sqlite":
+            return (True, "")
+        verb = "stop" if c.running else "start"
+        rc, out, err = self.run_docker([verb, c.name], timeout=20)
+        return (rc == 0, err.strip() or out.strip())
+
+    def _mysql_exec_args(self, c: DockerDbContainer, db: str = "", batch: bool = True) -> List[str]:
+        bin_name = "mariadb" if c.engine == "mariadb" else "mysql"
+        args = ["exec"]
+        if c.password:
+            args += ["-e", f"MYSQL_PWD={c.password}"]
+        args += [c.name, bin_name, "-u", c.user or "root", "--default-character-set=utf8mb4"]
+        if batch:
+            args += ["-B"]
+        else:
+            args += ["--table"]
+        if db:
+            args += ["-D", db]
+        return args
+
+    def _pg_exec_args(self, c: DockerDbContainer, db: str = "") -> List[str]:
+        args = ["exec"]
+        if c.password:
+            args += ["-e", f"PGPASSWORD={c.password}"]
+        args += [c.name, "psql", "-U", c.user or "postgres", "-d", db or c.default_db or "postgres", "-P", "pager=off"]
+        return args
+
+    def _mssql_exec_args(self, c: DockerDbContainer, db: str = "", headers: bool = True) -> List[str]:
+        if not hasattr(self, "_sqlcmd_paths"):
+            self._sqlcmd_paths: Dict[str, str] = {}
+        if c.name not in self._sqlcmd_paths:
+            _, out, _ = self.run_docker([
+                "exec", c.name, "sh", "-c",
+                "ls /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd 2>/dev/null | head -1",
+            ])
+            self._sqlcmd_paths[c.name] = out.strip() or "/opt/mssql-tools18/bin/sqlcmd"
+        args = ["exec", "-e", f"SQLCMDPASSWORD={c.password}", c.name, self._sqlcmd_paths[c.name],
+                "-C", "-S", "localhost", "-U", c.user or "sa", "-d", db or c.default_db or "master",
+                "-W", "-s", "\t", "-b"]
+        if not headers:
+            args += ["-h", "-1"]
+        return args
+
+    @staticmethod
+    def _parse_sqlcmd_table(out: str) -> Tuple[List[str], List[List[str]]]:
+        lines = [l for l in out.splitlines() if l.strip()]
+        if len(lines) < 2 or not set(lines[1].replace("\t", "")) <= {"-"}:
+            return ([], [])
+        return (lines[0].split("\t"), [l.split("\t") for l in lines[2:]])
+
+    def _redis_exec_args(self, c: DockerDbContainer, db: str = "0") -> List[str]:
+        args = ["exec"]
+        if c.password:
+            args += ["-e", f"REDISCLI_AUTH={c.password}"]
+        args += [c.name, "redis-cli", "-n", db if db.isdigit() else "0"]
+        return args
+
+    def list_databases_and_items(
+        self, c: DockerDbContainer, selected_db: str = ""
+    ) -> Tuple[str, List[str], List[Dict[str, str]], str]:
+        """Returns (active_db, databases_list, items_list[{name, count, extra}], summary_text)"""
+        if c.engine == "sqlite":
+            return self._sqlite_list(c)
+        if not c.running:
+            return ("", [], [], "Stopped")
+
+        if c.engine in ("mysql", "mariadb"):
+            rc, out, err = self.run_docker(
+                self._mysql_exec_args(c, batch=True) + ["-N", "-e", "SHOW DATABASES;"]
+            )
+            if rc != 0 and c.user == "root" and c.env.get("MYSQL_USER"):
+                # Fallback to app user if root auth differs
+                c.user = c.env["MYSQL_USER"]
+                c.password = c.env.get("MYSQL_PASSWORD", "")
+                rc, out, err = self.run_docker(
+                    self._mysql_exec_args(c, batch=True) + ["-N", "-e", "SHOW DATABASES;"]
+                )
+            if rc != 0:
+                return ("", [], [], f"Connection error: {err.strip()}")
+
+            system_dbs = {"information_schema", "performance_schema", "sys"}
+            dbs = [d.strip() for d in out.splitlines() if d.strip() and d.strip() not in system_dbs]
+            non_mysql = [d for d in dbs if d != "mysql"]
+            active_db = selected_db if selected_db in dbs else (c.default_db if c.default_db in dbs else (non_mysql[0] if non_mysql else (dbs[0] if dbs else "")))
+
+            items = []
+            if active_db:
+                safe_db = active_db.replace("'", "''")
+                sql = (
+                    "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0), "
+                    "ROUND((COALESCE(DATA_LENGTH,0) + COALESCE(INDEX_LENGTH,0)) / 1024, 1), TABLE_TYPE "
+                    f"FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{safe_db}' ORDER BY TABLE_NAME;"
+                )
+                rc2, t_out, _ = self.run_docker(self._mysql_exec_args(c, batch=True) + ["-N", "-e", sql])
+                if rc2 == 0:
+                    for line in t_out.splitlines():
+                        parts = line.split("\t")
+                        if parts and parts[0]:
+                            t_name = parts[0]
+                            t_rows = parts[1] if len(parts) > 1 else "0"
+                            t_kb = parts[2] if len(parts) > 2 else "0"
+                            items.append({
+                                "name": t_name,
+                                "count": f"{t_rows} rows",
+                                "extra": f"{t_kb} KB",
+                            })
+            return (active_db, dbs, items, f"{len(items)} tables in `{active_db}`")
+
+        if c.engine == "postgres":
+            rc, out, err = self.run_docker(
+                self._pg_exec_args(c, "postgres")
+                + ["-Atc", "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname;"]
+            )
+            if rc != 0:
+                return ("", [], [], f"Connection error: {err.strip()}")
+            dbs = [d.strip() for d in out.splitlines() if d.strip()]
+            user_dbs = [d for d in dbs if d != "postgres"]
+            fallback = c.default_db if c.default_db in user_dbs else (user_dbs[0] if user_dbs else (dbs[0] if dbs else "postgres"))
+            active_db = selected_db if selected_db in dbs else fallback
+
+            sql = (
+                "SELECT c.relname, CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint ELSE COALESCE(s.n_live_tup, 0) END, "
+                "pg_size_pretty(pg_total_relation_size(c.oid)) "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid "
+                "WHERE c.relkind IN ('r','p','v') AND n.nspname = 'public' ORDER BY c.relname;"
+            )
+            rc2, t_out, _ = self.run_docker(self._pg_exec_args(c, active_db) + ["-At", "-F", "\t", "-c", sql])
+            items = []
+            if rc2 == 0:
+                for line in t_out.splitlines():
+                    parts = line.split("\t")
+                    if parts and parts[0]:
+                        items.append({
+                            "name": parts[0],
+                            "count": f"{parts[1] if len(parts) > 1 else '0'} rows",
+                            "extra": parts[2] if len(parts) > 2 else "",
+                        })
+            return (active_db, dbs, items, f"{len(items)} tables in `{active_db}`")
+
+        if c.engine == "redis":
+            dbs = ["0", "1", "2", "3", "4", "5"]
+            active_db = selected_db if selected_db in dbs else "0"
+            sh_script = f"""
+            mem=$(redis-cli INFO memory 2>/dev/null | awk -F: '/^used_memory_human:/ {{gsub(/\\r/,"",$2); print $2}}')
+            sz=$(redis-cli -n {active_db} DBSIZE 2>/dev/null | tr -d '\\r')
+            printf "SUMMARY\\t%s\\t%s\\n" "$sz" "$mem"
+            redis-cli -n {active_db} --scan --count 200 2>/dev/null | head -n 150 | while IFS= read -r k; do
+              [ -n "$k" ] || continue
+              t=$(redis-cli -n {active_db} TYPE "$k" | tr -d '\\r')
+              ttl=$(redis-cli -n {active_db} TTL "$k" | tr -d '\\r')
+              printf "KEY\\t%s\\t%s\\t%s\\n" "$k" "$t" "$ttl"
+            done
+            """
+            exec_args = ["exec"]
+            if c.password:
+                exec_args += ["-e", f"REDISCLI_AUTH={c.password}"]
+            exec_args += [c.name, "sh", "-c", sh_script]
+            rc, out, err = self.run_docker(exec_args)
+            if rc != 0:
+                return (active_db, dbs, [], f"Redis error: {err.strip()}")
+
+            items = []
+            summary = f"Redis DB {active_db}"
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if parts[0] == "SUMMARY" and len(parts) >= 3:
+                    summary = f"DB {active_db}: {parts[1]} keys  •  Memory: {parts[2]}"
+                elif parts[0] == "KEY" and len(parts) >= 4:
+                    ttl_str = f"TTL: {parts[3]}s" if parts[3] not in ("-1", "-2") else ("no expiry" if parts[3] == "-1" else "")
+                    items.append({
+                        "name": parts[1],
+                        "count": parts[2],
+                        "extra": ttl_str,
+                    })
+            return (active_db, dbs, items, summary)
+
+        if c.engine == "mongodb":
+            auth_args = ["-u", c.user, "-p", c.password, "--authenticationDatabase", "admin"] if c.user else []
+            js = f"""
+            const dbs = db.adminCommand({{ listDatabases: 1 }}).databases.map(d => d.name);
+            const active = {json.dumps(selected_db or c.default_db or "admin")};
+            const userDbs = dbs.filter(d => !["admin", "config", "local"].includes(d));
+            const explicit = {json.dumps(bool(selected_db))};
+            const target = dbs.includes(active) && (explicit || userDbs.length === 0 || userDbs.includes(active))
+              ? active : (userDbs[0] || dbs[0] || "admin");
+            const cur = db.getSiblingDB(target);
+            const items = cur.getCollectionNames().map(name => ({{
+              name,
+              count: String(cur.getCollection(name).estimatedDocumentCount()) + " docs",
+              extra: "collection"
+            }}));
+            print(JSON.stringify({{ activeDb: target, databases: dbs, items }}));
+            """
+            rc, out, err = self.run_docker(["exec", c.name, "mongosh", "--quiet"] + auth_args + ["--eval", js])
+            if rc != 0:
+                return ("admin", ["admin"], [], f"MongoDB error: {err.strip()}")
+            try:
+                parsed = json.loads(out.strip().splitlines()[-1])
+                active_db = parsed.get("activeDb", "admin")
+                dbs = parsed.get("databases", ["admin"])
+                items = parsed.get("items", [])
+                return (active_db, dbs, items, f"{len(items)} collections in `{active_db}`")
+            except Exception as e:
+                return ("admin", ["admin"], [], str(e))
+
+        if c.engine == "mssql":
+            rc, out, err = self.run_docker(
+                self._mssql_exec_args(c, "master", headers=False)
+                + ["-Q", "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY name;"]
+            )
+            if rc != 0:
+                return ("", [], [], f"Connection error: {(err or out).strip()}")
+            dbs = [d.strip() for d in out.splitlines() if d.strip()] or ["master"]
+            active_db = selected_db if selected_db in dbs else (c.default_db if c.default_db in dbs else dbs[0])
+            sql = (
+                "SET NOCOUNT ON; SELECT t.name, SUM(p.rows), CAST(SUM(a.total_pages) * 8 AS varchar) + ' KB' "
+                "FROM sys.tables t JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) "
+                "JOIN sys.allocation_units a ON a.container_id = p.partition_id "
+                "GROUP BY t.name ORDER BY t.name;"
+            )
+            rc2, t_out, _ = self.run_docker(self._mssql_exec_args(c, active_db, headers=False) + ["-Q", sql])
+            items = []
+            if rc2 == 0:
+                for line in t_out.splitlines():
+                    parts = line.split("\t")
+                    if parts and parts[0].strip():
+                        items.append({
+                            "name": parts[0],
+                            "count": f"{parts[1] if len(parts) > 1 else '0'} rows",
+                            "extra": parts[2] if len(parts) > 2 else "",
+                        })
+            return (active_db, dbs, items, f"{len(items)} tables in `{active_db}`")
+
+        return ("", [], [], "Unsupported engine")
+
+    def fetch_table_rows(
+        self, c: DockerDbContainer, db: str, table_or_key: str, limit: int = 100
+    ) -> Tuple[List[str], List[List[str]], str]:
+        """Returns (headers, rows, raw_text)"""
+        if c.engine == "sqlite":
+            try:
+                headers, rows, _ = self._sqlite_run(
+                    c, f"SELECT * FROM {self._sqlite_ident(table_or_key)} LIMIT {int(limit)}")
+            except sqlite3.Error as e:
+                return (["Error"], [[str(e)]], str(e))
+            if not rows:
+                return (headers or ["(Empty table)"], [], "(0 rows)")
+            return (headers, rows, "")
+        if c.engine in ("mysql", "mariadb"):
+            safe_tbl = table_or_key.replace("`", "``")
+            sql = f"SELECT * FROM `{safe_tbl}` LIMIT {int(limit)};"
+            rc, out, err = self.run_docker(self._mysql_exec_args(c, db, batch=True) + ["-e", sql])
+            if rc != 0:
+                return (["Error"], [[err.strip() or out.strip()]], err.strip() or out.strip())
+            lines = out.splitlines()
+            if not lines:
+                return (["(Empty table)"], [], "(0 rows)")
+            headers = lines[0].split("\t")
+            rows = [line.split("\t") for line in lines[1:]]
+            return (headers, rows, out)
+
+        if c.engine == "postgres":
+            safe_tbl = table_or_key.replace('"', '""')
+            sql = f'COPY (SELECT * FROM "{safe_tbl}" LIMIT {int(limit)}) TO STDOUT WITH CSV HEADER;'
+            rc, out, err = self.run_docker(self._pg_exec_args(c, db) + ["-c", sql])
+            if rc != 0:
+                return (["Error"], [[err.strip() or out.strip()]], err.strip() or out.strip())
+            reader = list(csv.reader(io.StringIO(out)))
+            if not reader:
+                return (["(Empty table)"], [], "(0 rows)")
+            return (reader[0], reader[1:], out)
+
+        if c.engine == "redis":
+            sh_script = f"""
+            k={json.dumps(table_or_key)}
+            t=$(redis-cli -n {db} TYPE "$k" | tr -d '\\r')
+            ttl=$(redis-cli -n {db} TTL "$k" | tr -d '\\r')
+            printf "TYPE=%s\\nTTL=%s\\n" "$t" "$ttl"
+            case "$t" in
+              string) redis-cli -n {db} GET "$k" ;;
+              hash)   redis-cli -n {db} HGETALL "$k" ;;
+              list)   redis-cli -n {db} LRANGE "$k" 0 {int(limit)} ;;
+              set)    redis-cli -n {db} SMEMBERS "$k" ;;
+              zset)   redis-cli -n {db} ZRANGE "$k" 0 {int(limit)} WITHSCORES ;;
+              *)      redis-cli -n {db} DUMP "$k" ;;
+            esac
+            """
+            exec_args = ["exec"]
+            if c.password:
+                exec_args += ["-e", f"REDISCLI_AUTH={c.password}"]
+            exec_args += [c.name, "sh", "-c", sh_script]
+            rc, out, err = self.run_docker(exec_args)
+            if rc != 0:
+                return (["Error"], [[err.strip()]], err.strip())
+            lines = out.splitlines()
+            k_type = lines[0].split("=", 1)[1] if len(lines) > 0 and "=" in lines[0] else "unknown"
+            k_ttl = lines[1].split("=", 1)[1] if len(lines) > 1 and "=" in lines[1] else "-1"
+            body_lines = lines[2:]
+            if k_type == "hash":
+                rows = []
+                for i in range(0, len(body_lines), 2):
+                    f_name = body_lines[i]
+                    f_val = body_lines[i + 1] if i + 1 < len(body_lines) else ""
+                    rows.append([f_name, f_val])
+                return (["Field", "Value"], rows, "\n".join(body_lines))
+            if k_type == "zset":
+                rows = []
+                for i in range(0, len(body_lines), 2):
+                    member = body_lines[i]
+                    score = body_lines[i + 1] if i + 1 < len(body_lines) else ""
+                    rows.append([str(i // 2), member, score])
+                return (["#", "Member", "Score"], rows, "\n".join(body_lines))
+            if k_type in ("list", "set"):
+                rows = [[str(idx), val] for idx, val in enumerate(body_lines)]
+                return (["#", "Element"], rows, "\n".join(body_lines))
+            # string
+            full_val = "\n".join(body_lines)
+            return (["Key", "Type", "TTL", "Value"], [[table_or_key, k_type, k_ttl, full_val]], full_val)
+
+        if c.engine == "mongodb":
+            auth_args = ["-u", c.user, "-p", c.password, "--authenticationDatabase", "admin"] if c.user else []
+            js = f"""
+            const docs = db.getSiblingDB({json.dumps(db)}).getCollection({json.dumps(table_or_key)}).find({{}}).limit({int(limit)}).toArray();
+            print(EJSON.stringify(docs, null, 2));
+            """
+            rc, out, err = self.run_docker(["exec", c.name, "mongosh", "--quiet"] + auth_args + ["--eval", js])
+            if rc != 0:
+                return (["Error"], [[err.strip()]], err.strip())
+            try:
+                docs = json.loads(out)
+                if not docs:
+                    return (["(Empty collection)"], [], "[]")
+                keys: List[str] = []
+                for d in docs:
+                    if isinstance(d, dict):
+                        for k in d.keys():
+                            if k not in keys:
+                                keys.append(k)
+                def cell(v):
+                    # Unwrap Extended JSON scalars ({"$date": ...}, {"$oid": ...}, {"$numberLong": ...})
+                    if isinstance(v, dict) and len(v) == 1:
+                        (ek, ev), = v.items()
+                        if ek in ("$date", "$oid", "$numberLong", "$numberDecimal", "$numberDouble", "$numberInt"):
+                            if ek == "$date" and isinstance(ev, str):
+                                return ev.replace("T", " ").replace(".000Z", "").rstrip("Z")
+                            return str(ev.get("$numberLong", ev) if isinstance(ev, dict) else ev)
+                    if isinstance(v, bool):
+                        return "true" if v else "false"
+                    if v is None:
+                        return "null"
+                    if isinstance(v, (dict, list)):
+                        return json.dumps(v, ensure_ascii=False)
+                    return str(v)
+
+                rows = [[cell(d.get(k)) if k in d else "" for k in keys] for d in docs]
+                return (keys, rows, out)
+            except Exception:
+                return (["Document JSON"], [[out.strip()]], out)
+
+        if c.engine == "mssql":
+            safe_tbl = table_or_key.replace("]", "]]")
+            sql = f"SET NOCOUNT ON; SELECT TOP ({int(limit)}) * FROM [{safe_tbl}];"
+            rc, out, err = self.run_docker(self._mssql_exec_args(c, db) + ["-Q", sql])
+            if rc != 0:
+                return (["Error"], [[(err or out).strip()]], (err or out).strip())
+            headers, rows = self._parse_sqlcmd_table(out)
+            if not headers:
+                return (["(Empty table)"], [], "(0 rows)")
+            return (headers, rows, out)
+
+        return ([], [], "")
+
+    def fetch_table_structure(
+        self, c: DockerDbContainer, db: str, table_or_key: str
+    ) -> Tuple[List[str], List[List[str]], str]:
+        if c.engine == "sqlite":
+            try:
+                _, info, _ = self._sqlite_run(c, f"PRAGMA table_info({self._sqlite_ident(table_or_key)})")
+            except sqlite3.Error as e:
+                return (["Error"], [[str(e)]], str(e))
+            rows = [[r[1], r[2], "NO" if r[3] == "1" or r[5] != "0" else "YES", "" if r[4] == "NULL" else r[4], "YES" if r[5] != "0" else ""]
+                    for r in info]
+            return (["Column", "Type", "Nullable", "Default", "Primary Key"], rows, "")
+        if c.engine in ("mysql", "mariadb"):
+            safe_tbl = table_or_key.replace("`", "``")
+            sql = f"DESCRIBE `{safe_tbl}`;"
+            rc, out, err = self.run_docker(self._mysql_exec_args(c, db, batch=True) + ["-e", sql])
+            if rc != 0:
+                return (["Error"], [[err.strip()]], err.strip())
+            lines = out.splitlines()
+            if not lines:
+                return ([], [], "")
+            return (lines[0].split("\t"), [l.split("\t") for l in lines[1:]], out)
+
+        if c.engine == "postgres":
+            safe_tbl = table_or_key.replace("'", "''")
+            sql = (
+                "SELECT column_name, data_type, is_nullable, column_default "
+                f"FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '{safe_tbl}' "
+                "ORDER BY ordinal_position;"
+            )
+            rc, out, err = self.run_docker(self._pg_exec_args(c, db) + ["-At", "-F", "\t", "-c", sql])
+            if rc != 0:
+                return (["Error"], [[err.strip()]], err.strip())
+            rows = [l.split("\t") for l in out.splitlines() if l.strip()]
+            return (["Column", "Type", "Nullable", "Default"], rows, out)
+
+        if c.engine == "mssql":
+            safe_tbl = table_or_key.replace("'", "''")
+            sql = (
+                "SET NOCOUNT ON; SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COALESCE(COLUMN_DEFAULT, '') "
+                f"FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{safe_tbl}' ORDER BY ORDINAL_POSITION;"
+            )
+            rc, out, err = self.run_docker(self._mssql_exec_args(c, db, headers=False) + ["-Q", sql])
+            if rc != 0:
+                return (["Error"], [[(err or out).strip()]], (err or out).strip())
+            rows = [l.split("\t") for l in out.splitlines() if l.strip()]
+            return (["Column", "Type", "Nullable", "Default"], rows, out)
+
+        return (["Info"], [[f"Structure view not applicable for {c.engine_label}"]], "")
+
+    def execute_query(
+        self, c: DockerDbContainer, db: str, query: str
+    ) -> Tuple[List[str], List[List[str]], str]:
+        t0 = time.monotonic()
+        if c.engine == "sqlite":
+            try:
+                headers, rows, raw = self._sqlite_run(c, query)
+            except sqlite3.Error as e:
+                elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
+                return (["Error"], [[str(e)]], f"ERROR ({elapsed}):\n{e}")
+            elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
+            return (headers, rows, f"-- {len(rows)} rows in {elapsed}" + (f"\n{raw}" if raw else ""))
+        if c.engine in ("mysql", "mariadb"):
+            rc, out, err = self.run_docker(self._mysql_exec_args(c, db, batch=True) + ["-e", query], timeout=30)
+            elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
+            if rc != 0:
+                return (["Error"], [[err.strip() or out.strip()]], f"ERROR ({elapsed}):\n{err.strip() or out.strip()}")
+            lines = out.splitlines()
+            if not lines:
+                return (["Status"], [[f"Query OK ({elapsed})"]], f"Query executed successfully in {elapsed}.")
+            headers = lines[0].split("\t")
+            rows = [l.split("\t") for l in lines[1:]]
+            return (headers, rows, f"-- {len(rows)} rows in {elapsed}\n{out}")
+
+        if c.engine == "postgres":
+            rc, out, err = self.run_docker(self._pg_exec_args(c, db) + ["-F", "\t", "-A", "-c", query], timeout=30)
+            elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
+            if rc != 0:
+                return (["Error"], [[err.strip() or out.strip()]], f"ERROR ({elapsed}):\n{err.strip() or out.strip()}")
+            lines = out.splitlines()
+            if len(lines) >= 2 and "\t" in lines[0]:
+                headers = lines[0].split("\t")
+                # Last line in psql -A is "(N rows)"
+                body = lines[1:-1] if lines[-1].startswith("(") else lines[1:]
+                rows = [l.split("\t") for l in body]
+                return (headers, rows, f"-- {elapsed}\n{out}")
+            return (["Result"], [[out.strip() or f"OK ({elapsed})"]], out)
+
+        if c.engine == "redis":
+            exec_args = ["exec", "-e", f"REDIS_CMD={query}"]
+            if c.password:
+                exec_args += ["-e", f"REDISCLI_AUTH={c.password}"]
+            exec_args += [c.name, "sh", "-c", f'eval "redis-cli -n {db if db.isdigit() else 0} $REDIS_CMD"']
+            rc, out, err = self.run_docker(exec_args, timeout=20)
+            elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
+            text = (out or err).strip()
+            rows = [[str(i + 1), line] for i, line in enumerate(text.splitlines())]
+            return (["#", f"Output ({elapsed})"], rows, text)
+
+        if c.engine == "mongodb":
+            auth_args = ["-u", c.user, "-p", c.password, "--authenticationDatabase", "admin"] if c.user else []
+            js = f"""
+            const targetDb = db.getSiblingDB({json.dumps(db or "admin")});
+            const res = (function(db) {{ return eval({json.dumps(query)}); }})(targetDb);
+            if (res && typeof res.toArray === 'function') print(EJSON.stringify(res.toArray(), null, 2));
+            else print(EJSON.stringify(res, null, 2));
+            """
+            rc, out, err = self.run_docker(["exec", c.name, "mongosh", "--quiet"] + auth_args + ["--eval", js], timeout=30)
+            text = (out or err).strip()
+            return (["MongoDB Output"], [[text]], text)
+
+        if c.engine == "mssql":
+            rc, out, err = self.run_docker(self._mssql_exec_args(c, db) + ["-Q", "SET NOCOUNT ON; " + query], timeout=30)
+            elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
+            if rc != 0:
+                return (["Error"], [[(err or out).strip()]], f"ERROR ({elapsed}):\n{(err or out).strip()}")
+            headers, rows = self._parse_sqlcmd_table(out)
+            if not headers:
+                return (["Status"], [[f"Query OK ({elapsed})"]], out.strip() or f"Query executed successfully in {elapsed}.")
+            return (headers, rows, f"-- {len(rows)} rows in {elapsed}\n{out}")
+
+        return (["Output"], [["Unsupported engine"]], "")
+
+    def open_interactive_terminal(self, c: DockerDbContainer, db: str = ""):
+        if c.engine == "sqlite":
+            subprocess.Popen(
+                ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal",
+                 "sqlite3", c.default_db],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        prefix = "sudo docker" if self._use_sudo else "docker"
+        target_db = db or c.default_db
+        if c.engine in ("mysql", "mariadb"):
+            bin_name = "mariadb" if c.engine == "mariadb" else "mysql"
+            pw_env = f"-e MYSQL_PWD={json.dumps(c.password)} " if c.password else ""
+            cmd = f"{prefix} exec -it {pw_env}{c.name} {bin_name} -u {c.user or 'root'} {target_db}"
+        elif c.engine == "postgres":
+            pw_env = f"-e PGPASSWORD={json.dumps(c.password)} " if c.password else ""
+            cmd = f"{prefix} exec -it {pw_env}{c.name} psql -U {c.user or 'postgres'} -d {target_db or 'postgres'}"
+        elif c.engine == "redis":
+            pw_env = f"-e REDISCLI_AUTH={json.dumps(c.password)} " if c.password else ""
+            cmd = f"{prefix} exec -it {pw_env}{c.name} redis-cli -n {target_db if target_db.isdigit() else '0'}"
+        elif c.engine == "mongodb":
+            auth = f"-u {c.user} -p {json.dumps(c.password)} --authenticationDatabase admin" if c.user else ""
+            cmd = f"{prefix} exec -it {c.name} mongosh {auth} {target_db or 'admin'}"
+        else:
+            cmd = f"{prefix} exec -it {c.name} sh"
+        if c.engine == "mssql":
+            sqlcmd = self._mssql_exec_args(c, target_db)[4]
+            cmd = (f"{prefix} exec -it -e SQLCMDPASSWORD={json.dumps(c.password)} {c.name} {sqlcmd} "
+                   f"-C -S localhost -U {c.user or 'sa'} -d {target_db or 'master'}")
+
+        subprocess.Popen(
+            ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal", "bash", "-lc", cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Background Worker Thread for Non-Blocking Docker / DB Calls
+# ---------------------------------------------------------------------------
+
+class AsyncDbWorker(QThread):
+    succeeded = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+    def __init__(self, req_id: int, fn: Callable[[], Any], parent=None):
+        super().__init__(parent)
+        self.req_id = req_id
+        self.fn = fn
+
+    def run(self):
+        try:
+            result = self.fn()
+            self.succeeded.emit(self.req_id, result)
+        except Exception as exc:
+            self.failed.emit(self.req_id, str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Standalone PyQt6 Main Window
+# ---------------------------------------------------------------------------
+
+class OmatableWindow(QMainWindow):
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, initial_container: str = "", sqlite_path: str = ""):
+        super().__init__()
+        self.backend = DockerDbBackend()
+        self.theme = load_omarchy_theme()
+        self.font_family = load_omarchy_font()
+
+        self.containers: List[DockerDbContainer] = []
+        self.current_container: Optional[DockerDbContainer] = None
+        self.current_db: str = ""
+        self.current_items: List[Dict[str, str]] = []
+        self.current_table: str = ""
+        self.current_headers: List[str] = []
+        self.current_rows: List[List[str]] = []
+        self.initial_container = initial_container
+        self.sqlite_path = sqlite_path
+        self._queries: Dict[str, str] = {}
+
+        self._req_counter = 0
+        self._active_workers: Dict[int, AsyncDbWorker] = {}
+        self._alive_threads: set = set()
+        self._loading_label = ""
+        self._spinner_idx = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(80)
+        self._spinner_timer.timeout.connect(self._tick_spinner)
+
+        self.setWindowTitle(f"{os.path.basename(sqlite_path)} — Omatable" if sqlite_path else "Omatable")
+        self.resize(1280, 800)
+        self._apply_stylesheet()
+        self._build_ui()
+        self._setup_shortcuts()
+        self._tune_scrolling()
+
+        QTimer.singleShot(50, self.refresh_containers)
+
+    def _apply_stylesheet(self):
+        bg = self.theme["background"]
+        dark_bg = self.theme["dark_background"]
+        darker_bg = self.theme["darker_background"]
+        lighter_bg = self.theme["lighter_background"]
+        fg = self.theme["foreground"]
+        muted = self.theme["muted"]
+        sel_bg = self.theme["selection_background"]
+        blue = self.theme["blue"]
+        cyan = self.theme["cyan"]
+        green = self.theme["green"]
+
+        # Qt stylesheets can only draw the combo arrow from an image file
+        chevron_path = os.path.join(tempfile.gettempdir(), f"omatable-chevron-{os.getuid()}.svg")
+        try:
+            with open(chevron_path, "w") as f:
+                f.write(
+                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8">'
+                    f'<path d="M1 1.5l5 5 5-5" fill="none" stroke="{muted}" stroke-width="1.6" '
+                    'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+                )
+        except OSError:
+            pass
+
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background-color: {bg};
+                color: {fg};
+                font-family: "{self.font_family}", monospace;
+                font-size: 13px;
+            }}
+            QListWidget {{
+                background-color: {dark_bg};
+                border: 1px solid {lighter_bg};
+                border-radius: 6px;
+                padding: 4px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                padding: 8px 10px;
+                border-radius: 4px;
+                margin-bottom: 2px;
+            }}
+            QListWidget::item:selected {{
+                background-color: {sel_bg};
+                color: #ffffff;
+                font-weight: bold;
+            }}
+            QListWidget::item:hover {{
+                background-color: {lighter_bg};
+            }}
+            QTableWidget {{
+                background-color: {darker_bg};
+                alternate-background-color: {dark_bg};
+                gridline-color: {lighter_bg};
+                border: 1px solid {lighter_bg};
+                border-radius: 6px;
+                selection-background-color: {sel_bg};
+                selection-color: #ffffff;
+            }}
+            QHeaderView::section {{
+                background-color: {lighter_bg};
+                color: {fg};
+                font-weight: bold;
+                padding: 6px 10px;
+                border: none;
+                border-right: 1px solid {dark_bg};
+                border-bottom: 1px solid {dark_bg};
+            }}
+            QLineEdit, QComboBox, QPlainTextEdit {{
+                background-color: {dark_bg};
+                color: {fg};
+                border: 1px solid {lighter_bg};
+                border-radius: 5px;
+                padding: 6px 10px;
+            }}
+            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
+                border: 1px solid {blue};
+            }}
+            QComboBox {{
+                padding-right: 28px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {muted};
+            }}
+            QComboBox::drop-down {{
+                subcontrol-origin: padding;
+                subcontrol-position: center right;
+                width: 26px;
+                border: none;
+                background: transparent;
+            }}
+            QComboBox::down-arrow {{
+                image: url({chevron_path});
+                width: 12px;
+                height: 8px;
+            }}
+            QComboBox::down-arrow:on {{
+                top: 1px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {dark_bg};
+                color: {fg};
+                border: 1px solid {lighter_bg};
+                border-radius: 6px;
+                padding: 4px;
+                outline: none;
+                selection-background-color: {sel_bg};
+                selection-color: {fg};
+            }}
+            QComboBox QAbstractItemView::item {{
+                min-height: 26px;
+                padding: 2px 8px;
+                border-radius: 4px;
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 10px;
+                margin: 2px;
+            }}
+            QScrollBar:horizontal {{
+                background: transparent;
+                height: 10px;
+                margin: 2px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {muted};
+                border-radius: 3px;
+                min-height: 32px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {muted};
+                border-radius: 3px;
+                min-width: 32px;
+            }}
+            QScrollBar::handle:hover {{
+                background: {blue};
+            }}
+            QScrollBar::add-line, QScrollBar::sub-line {{
+                width: 0px;
+                height: 0px;
+                border: none;
+                background: none;
+            }}
+            QScrollBar::add-page, QScrollBar::sub-page {{
+                background: none;
+            }}
+            QAbstractScrollArea::corner {{
+                background: transparent;
+            }}
+            QPushButton {{
+                background-color: {lighter_bg};
+                color: {fg};
+                border: 1px solid {muted};
+                border-radius: 5px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: {sel_bg};
+                border-color: {blue};
+            }}
+            QPushButton#primaryBtn {{
+                background-color: {blue};
+                color: {darker_bg};
+                border: none;
+            }}
+            QPushButton#dangerBtn {{
+                background-color: {self.theme["red"]};
+                color: {darker_bg};
+                border: none;
+            }}
+            QPushButton#successBtn {{
+                background-color: {green};
+                color: {darker_bg};
+                border: none;
+            }}
+            QTabWidget::pane {{
+                border: 1px solid {lighter_bg};
+                border-radius: 6px;
+                background-color: {bg};
+            }}
+            QTabBar::tab {{
+                background-color: {dark_bg};
+                color: {muted};
+                padding: 8px 16px;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                margin-right: 4px;
+                font-weight: bold;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {lighter_bg};
+                color: {fg};
+                border-bottom: 2px solid {blue};
+            }}
+            QMenu {{
+                background-color: {dark_bg};
+                color: {fg};
+                border: 1px solid {lighter_bg};
+                border-radius: 6px;
+                padding: 4px;
+            }}
+            QMenu::item {{
+                padding: 6px 24px 6px 12px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background-color: {sel_bg};
+            }}
+            QMenu::item:disabled {{
+                color: {muted};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {lighter_bg};
+                margin: 4px 6px;
+            }}
+            QStatusBar {{
+                background-color: {darker_bg};
+                color: {muted};
+                border-top: 1px solid {lighter_bg};
+            }}
+        """)
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(10, 10, 10, 6)
+        root_layout.setSpacing(6)
+
+        # Main Splitter: sidebar | workspace
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left Sidebar: Docker DB containers on top, database & tables below
+        sidebar = QSplitter(Qt.Orientation.Vertical)
+
+        pane_containers = QWidget()
+        l1 = QVBoxLayout(pane_containers)
+        l1.setContentsMargins(0, 0, 0, 0)
+        l1.setSpacing(6)
+        self.container_list = QListWidget()
+        self.container_list.currentRowChanged.connect(self.on_container_selected)
+        self.container_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.container_list.customContextMenuRequested.connect(self.show_container_menu)
+        l1.addWidget(self.container_list)
+        sidebar.addWidget(pane_containers)
+
+        pane_schema = QWidget()
+        l2 = QVBoxLayout(pane_schema)
+        l2.setContentsMargins(0, 6, 0, 0)
+        l2.setSpacing(6)
+
+        self.db_combo = QComboBox()
+        self.db_combo.currentTextChanged.connect(self.on_database_changed)
+        l2.addWidget(self.db_combo)
+
+        self.table_filter = QLineEdit()
+        self.table_filter.setPlaceholderText("Filter")
+        self.table_filter.textChanged.connect(self.populate_items_list)
+        l2.addWidget(self.table_filter)
+
+        self.items_list = QListWidget()
+        self.items_list.currentRowChanged.connect(self.on_item_selected)
+        l2.addWidget(self.items_list)
+        sidebar.addWidget(pane_schema)
+        sidebar.setSizes([260, 520])
+
+        if self.sqlite_path:
+            # A single file: show just its name on top, no database picker
+            self.db_combo.setVisible(False)
+            self.container_list.setFixedHeight(64)
+            self.container_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.container_list.setToolTip(os.path.abspath(self.sqlite_path))
+            pane_containers.setFixedHeight(64)
+            sidebar.setHandleWidth(0)
+
+        splitter.addWidget(sidebar)
+
+        # Pane 3: Data Grid, Structure & SQL/Command Console
+        pane_main = QWidget()
+        l3 = QVBoxLayout(pane_main)
+        l3.setContentsMargins(0, 0, 0, 0)
+        l3.setSpacing(6)
+
+        self.tabs = QTabWidget()
+
+        # Tab 1: Data Browser
+        tab_data = QWidget()
+        td_layout = QVBoxLayout(tab_data)
+        td_layout.setContentsMargins(6, 6, 6, 6)
+        td_layout.setSpacing(6)
+
+        data_toolbar = QHBoxLayout()
+        self.row_search = QLineEdit()
+        self.row_search.setPlaceholderText("Search")
+        self.row_search.textChanged.connect(self.filter_loaded_rows)
+        data_toolbar.addWidget(self.row_search, 1)
+
+        data_toolbar.addWidget(QLabel("Limit"))
+        self.limit_combo = QComboBox()
+        self.limit_combo.addItems(["50", "100", "250", "500", "1000"])
+        self.limit_combo.setCurrentText("100")
+        self.limit_combo.currentTextChanged.connect(lambda _: self.reload_current_table())
+        data_toolbar.addWidget(self.limit_combo)
+
+        btn_reload_table = QPushButton("  Reload")
+        btn_reload_table.clicked.connect(self.reload_current_table)
+        data_toolbar.addWidget(btn_reload_table)
+
+        btn_copy_json = QPushButton("󰆏  Copy JSON")
+        btn_copy_json.clicked.connect(self.copy_table_as_json)
+        data_toolbar.addWidget(btn_copy_json)
+
+        btn_copy_csv = QPushButton("󰆏  Copy CSV")
+        btn_copy_csv.clicked.connect(self.copy_table_as_csv)
+        data_toolbar.addWidget(btn_copy_csv)
+
+        td_layout.addLayout(data_toolbar)
+
+        self.data_table = QTableWidget()
+        self.data_table.setAlternatingRowColors(True)
+        self.data_table.setSortingEnabled(True)
+        self.data_table.cellDoubleClicked.connect(self.inspect_cell_dialog)
+        td_layout.addWidget(self.data_table)
+
+        self.tabs.addTab(tab_data, "󰓫  Data")
+
+        # Tab 2: Table Structure / Columns
+        tab_struct = QWidget()
+        ts_layout = QVBoxLayout(tab_struct)
+        ts_layout.setContentsMargins(6, 6, 6, 6)
+        self.struct_table = QTableWidget()
+        self.struct_table.setAlternatingRowColors(True)
+        ts_layout.addWidget(self.struct_table)
+        self.tabs.addTab(tab_struct, "󰙅  Structure")
+
+        # Tab 3: Query Console
+        tab_query = QWidget()
+        tq_layout = QVBoxLayout(tab_query)
+        tq_layout.setContentsMargins(6, 6, 6, 6)
+        tq_layout.setSpacing(6)
+
+
+        btn_run_query = QPushButton("󰐊  Run")
+        btn_run_query.setObjectName("primaryBtn")
+        btn_run_query.clicked.connect(self.run_custom_query)
+        btn_run_query.setVisible(False)
+        self.btn_run_query = btn_run_query
+
+        q_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.query_editor = QPlainTextEdit()
+        q_splitter.addWidget(self.query_editor)
+
+        q_res_widget = QWidget()
+        qr_layout = QVBoxLayout(q_res_widget)
+        qr_layout.setContentsMargins(0, 0, 0, 0)
+        self.query_table = QTableWidget()
+        self.query_table.setAlternatingRowColors(True)
+        self.query_table.setSortingEnabled(True)
+        self.query_table.cellDoubleClicked.connect(self.inspect_query_cell_dialog)
+        qr_layout.addWidget(self.query_table)
+
+        # One quiet line under the grid: row count and time, or the error
+        self.query_raw = QLabel("")
+        self.query_raw.setWordWrap(True)
+        self.query_raw.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.query_raw.setStyleSheet(f"color: {self.theme['muted']}; padding: 2px 4px;")
+        qr_layout.addWidget(self.query_raw)
+        q_splitter.addWidget(q_res_widget)
+        q_splitter.setSizes([180, 420])
+
+        tq_layout.addWidget(q_splitter)
+        self.tabs.addTab(tab_query, "  Query")
+
+        self.tabs.setCornerWidget(self.btn_run_query, Qt.Corner.TopRightCorner)
+        self.tabs.currentChanged.connect(lambda i: self.btn_run_query.setVisible(i == 2))
+        l3.addWidget(self.tabs)
+        splitter.addWidget(pane_main)
+        splitter.setSizes([300, 980])
+
+        root_layout.addWidget(splitter, 1)
+
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+
+    def _tune_scrolling(self):
+        # Smooth per-pixel scrolling with a bigger step than Qt's per-item default
+        for view in self.findChildren(QAbstractItemView):
+            view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            view.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            view.verticalScrollBar().setSingleStep(24)
+            view.horizontalScrollBar().setSingleStep(24)
+
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_containers)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.table_filter.setFocus())
+        QShortcut(QKeySequence("/"), self, activated=lambda: self.row_search.setFocus())
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_terminal_shell)
+        QShortcut(QKeySequence("Ctrl+Shift+C"), self, activated=self.copy_connection_url)
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.run_custom_query)
+        QShortcut(QKeySequence("F5"), self, activated=self.run_custom_query)
+        QShortcut(QKeySequence("Alt+1"), self, activated=lambda: self.tabs.setCurrentIndex(0))
+        QShortcut(QKeySequence("Alt+2"), self,
+                  activated=lambda: self.tabs.isTabVisible(1) and self.tabs.setCurrentIndex(1))
+        QShortcut(QKeySequence("Alt+3"), self, activated=lambda: self.tabs.setCurrentIndex(2))
+        QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.close)
+
+    # -----------------------------------------------------------------------
+    # Loader & Async Execution Engine
+    # -----------------------------------------------------------------------
+
+    def _tick_spinner(self):
+        if not self._active_workers:
+            self._spinner_timer.stop()
+            return
+        self._spinner_idx = (self._spinner_idx + 1) % len(self.SPINNER_FRAMES)
+        frame = self.SPINNER_FRAMES[self._spinner_idx]
+        self.status_bar.showMessage(f"{frame}  {self._loading_label}")
+
+    def _set_loading(self, active: bool, label: str = "Loading..."):
+        if active:
+            self._loading_label = label
+            frame = self.SPINNER_FRAMES[self._spinner_idx]
+            self.status_bar.showMessage(f"{frame}  {label}")
+            if not self._spinner_timer.isActive():
+                self._spinner_timer.start()
+        elif not self._active_workers:
+            self._spinner_timer.stop()
+
+    def _run_async(self, label: str, fn: Callable[[], Any], on_done: Callable[[Any], None]):
+        # In headless unit tests when window is not shown, run synchronously
+        if not self.isVisible():
+            self._set_loading(True, label)
+            try:
+                res = fn()
+                on_done(res)
+            finally:
+                self._set_loading(False)
+            return
+
+        self._req_counter += 1
+        req_id = self._req_counter
+        self._set_loading(True, label)
+
+        worker = AsyncDbWorker(req_id, fn, self)
+        self._active_workers[req_id] = worker
+
+        def _handle_ok(r_id: int, result: Any):
+            self._active_workers.pop(r_id, None)
+            self._set_loading(False)
+            # Only apply if this is the latest request or no newer request superseded it
+            if r_id == self._req_counter:
+                try:
+                    on_done(result)
+                except Exception as exc:
+                    self.status_bar.showMessage(f"Error: {exc}")
+
+        def _handle_err(r_id: int, err_msg: str):
+            self._active_workers.pop(r_id, None)
+            self._set_loading(False)
+            self.status_bar.showMessage(f"Error: {err_msg}")
+
+        def _handle_finished():
+            # Only release the QThread once run() has fully returned; deleting it
+            # from the result signal aborts the process ("Destroyed while thread is still running")
+            self._alive_threads.discard(worker)
+            worker.deleteLater()
+
+        worker.succeeded.connect(_handle_ok)
+        worker.failed.connect(_handle_err)
+        worker.finished.connect(_handle_finished)
+        self._alive_threads.add(worker)
+        worker.start()
+
+    def closeEvent(self, event):
+        for worker in list(self._alive_threads):
+            worker.wait(15000)
+        super().closeEvent(event)
+
+    # -----------------------------------------------------------------------
+    # Actions & Event Handlers
+    # -----------------------------------------------------------------------
+
+    def refresh_containers(self):
+        if self.sqlite_path:
+            self.containers = [self.backend.sqlite_file(self.sqlite_path)]
+            c = self.containers[0]
+            self.container_list.blockSignals(True)
+            self.container_list.clear()
+            self.container_list.addItem(f"{c.name}\n{c.engine_label} {c.version}")
+            self.container_list.setCurrentRow(0)
+            self.container_list.blockSignals(False)
+            self.on_container_selected(0)
+            return
+
+        prev_name = self.current_container.name if self.current_container else self.initial_container
+        self.initial_container = ""
+
+        def _task():
+            return self.backend.discover_containers()
+
+        def _done(discovered: List[DockerDbContainer]):
+            self.containers = discovered
+            self.container_list.blockSignals(True)
+            self.container_list.clear()
+
+            selected_idx = 0
+            for idx, c in enumerate(self.containers):
+                label = f"{c.name}\n{c.engine_label} {c.version}".rstrip()
+                item = QListWidgetItem(label)
+                if not c.running:
+                    item.setForeground(QColor(self.theme["muted"]))
+                self.container_list.addItem(item)
+                if prev_name and c.name == prev_name:
+                    selected_idx = idx
+
+            self.container_list.blockSignals(False)
+            if self.containers:
+                self.container_list.blockSignals(True)
+                self.container_list.setCurrentRow(selected_idx)
+                self.container_list.blockSignals(False)
+                self.on_container_selected(selected_idx)
+            else:
+                self.current_container = None
+                self.db_combo.clear()
+                self.items_list.clear()
+                self.status_bar.showMessage("No database containers")
+
+        self._run_async("Scanning Docker containers...", _task, _done)
+
+    def on_container_selected(self, row: int):
+        if row < 0 or row >= len(self.containers):
+            return
+        c = self.containers[row]
+        prev = self.current_container
+        if prev is not c:
+            # Each container keeps its own query; results never carry over
+            if prev is not None:
+                self._queries[prev.name] = self.query_editor.toPlainText()
+            self.query_editor.setPlainText(self._queries.get(c.name, ""))
+            self.query_table.setRowCount(0)
+            self.query_table.setColumnCount(0)
+            self.query_raw.setText("")
+        self.current_container = c
+
+        # Document and key-value stores have no column structure to show
+        has_structure = c.engine not in ("mongodb", "redis")
+        if not has_structure and self.tabs.currentIndex() == 1:
+            self.tabs.setCurrentIndex(0)
+        self.tabs.setTabVisible(1, has_structure)
+
+        if not c.running:
+            self.db_combo.blockSignals(True)
+            self.db_combo.clear()
+            self.db_combo.blockSignals(False)
+            self.items_list.clear()
+            self.data_table.setRowCount(0)
+            self.data_table.setColumnCount(0)
+            self.struct_table.setRowCount(0)
+            self.struct_table.setColumnCount(0)
+            self.status_bar.showMessage(f"{c.name} is stopped")
+            return
+
+        # Show immediate loading placeholder in the middle pane
+        self.items_list.blockSignals(True)
+        self.items_list.clear()
+        self.items_list.blockSignals(False)
+
+        def _task():
+            return self.backend.list_databases_and_items(c)
+
+        def _done(res):
+            active_db, dbs, items, summary = res
+            self.current_db = active_db
+            self.current_items = items
+
+            self.db_combo.blockSignals(True)
+            self.db_combo.clear()
+            self.db_combo.addItems(dbs)
+            if active_db in dbs:
+                self.db_combo.setCurrentText(active_db)
+            self.db_combo.blockSignals(False)
+
+            self.populate_items_list()
+            self.status_bar.showMessage(f"Connected to {c.name}  •  {summary}  •  {c.connection_url}")
+
+        self._run_async(f"Connecting to {c.name} ({c.engine_label})...", _task, _done)
+
+    def on_database_changed(self, db_name: str):
+        if not self.current_container or not db_name:
+            return
+        self.current_db = db_name
+        c = self.current_container
+
+        self.items_list.blockSignals(True)
+        self.items_list.clear()
+        self.items_list.blockSignals(False)
+
+        def _task():
+            return self.backend.list_databases_and_items(c, db_name)
+
+        def _done(res):
+            _, _, items, summary = res
+            self.current_items = items
+            self.populate_items_list()
+            self.status_bar.showMessage(f"{c.name} / {db_name}  •  {summary}")
+
+        self._run_async(f"Loading database {c.name}/{db_name}...", _task, _done)
+
+    def populate_items_list(self):
+        flt = self.table_filter.text().strip().lower()
+        self.items_list.blockSignals(True)
+        self.items_list.clear()
+        self._filtered_items: List[Dict[str, str]] = []
+
+        for it in self.current_items:
+            name = it.get("name", "")
+            if flt and flt not in name.lower():
+                continue
+            self._filtered_items.append(it)
+            cnt = it.get("count", "")
+            extra = it.get("extra", "")
+            meta = f"  ({cnt}{', ' + extra if extra else ''})" if cnt else ""
+            self.items_list.addItem(f"󰓫  {name}{meta}")
+
+        if not self._filtered_items:
+            empty = QListWidgetItem("No tables" if not flt else "No matching tables")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.items_list.addItem(empty)
+        self.items_list.blockSignals(False)
+        if self._filtered_items:
+            self.items_list.blockSignals(True)
+            self.items_list.setCurrentRow(0)
+            self.items_list.blockSignals(False)
+            self.on_item_selected(0)
+        else:
+            self.data_table.setRowCount(0)
+            self.data_table.setColumnCount(0)
+            self.struct_table.setRowCount(0)
+            self.struct_table.setColumnCount(0)
+
+    def on_item_selected(self, row: int):
+        if not hasattr(self, "_filtered_items") or row < 0 or row >= len(self._filtered_items):
+            return
+        item = self._filtered_items[row]
+        self.current_table = item["name"]
+        self.reload_current_table()
+
+    def reload_current_table(self):
+        if not self.current_container or not self.current_table:
+            return
+        c = self.current_container
+        db_name = self.current_db
+        tbl_name = self.current_table
+        limit = int(self.limit_combo.currentText() or "100")
+
+        def _task():
+            headers, rows, _ = self.backend.fetch_table_rows(c, db_name, tbl_name, limit=limit)
+            s_headers, s_rows, _ = self.backend.fetch_table_structure(c, db_name, tbl_name)
+            return headers, rows, s_headers, s_rows
+
+        def _done(res):
+            headers, rows, s_headers, s_rows = res
+            self.current_headers = headers
+            self.current_rows = rows
+            self._fill_table_widget(self.data_table, headers, rows)
+            self.filter_loaded_rows()
+            self._fill_table_widget(self.struct_table, s_headers, s_rows)
+            self.status_bar.showMessage(
+                f"{c.name} → {db_name}.{tbl_name}: loaded {len(rows)} row(s)"
+            )
+
+        self._run_async(f"Loading {db_name}.{tbl_name} (limit {limit})...", _task, _done)
+
+    @staticmethod
+    def _fill_table_widget(widget: QTableWidget, headers: List[str], rows: List[List[str]]):
+        widget.setSortingEnabled(False)
+        widget.clear()
+        widget.setColumnCount(len(headers))
+        widget.setHorizontalHeaderLabels(headers)
+        widget.setRowCount(len(rows))
+
+        for r_idx, row in enumerate(rows):
+            for c_idx, val in enumerate(row):
+                if c_idx >= len(headers):
+                    break
+                cell = QTableWidgetItem(val)
+                cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                widget.setItem(r_idx, c_idx, cell)
+
+        widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        widget.resizeColumnsToContents()
+        for c_idx in range(len(headers)):
+            if widget.columnWidth(c_idx) > 360:
+                widget.setColumnWidth(c_idx, 360)
+        widget.setSortingEnabled(True)
+
+    def filter_loaded_rows(self):
+        needle = self.row_search.text().strip().lower()
+        for r in range(self.data_table.rowCount()):
+            if not needle:
+                self.data_table.setRowHidden(r, False)
+                continue
+            matched = False
+            for c in range(self.data_table.columnCount()):
+                item = self.data_table.item(r, c)
+                if item and needle in item.text().lower():
+                    matched = True
+                    break
+            self.data_table.setRowHidden(r, not matched)
+
+    def run_custom_query(self):
+        if not self.current_container or not self.current_container.running:
+            return
+        q = self.query_editor.toPlainText().strip()
+        if not q:
+            return
+        self.tabs.setCurrentIndex(2)
+        c = self.current_container
+        db_name = self.current_db
+        if is_write_query(c.engine, q) and not self._confirm_write_query(c, db_name, q):
+            return
+
+        def _task():
+            t0 = time.monotonic()
+            res = self.backend.execute_query(c, db_name, q)
+            return res, (time.monotonic() - t0) * 1000
+
+        def _done(res):
+            (headers, rows, raw), elapsed_ms = res
+            if headers == ["Error"]:
+                self.query_table.setRowCount(0)
+                self.query_table.setColumnCount(0)
+            else:
+                self._fill_table_widget(self.query_table, headers, rows)
+            elapsed = f"{elapsed_ms:.0f} ms" if elapsed_ms >= 10 else f"{elapsed_ms:.1f} ms"
+            # Below the grid: only the outcome, never the result rows again
+            self.query_raw.setStyleSheet(f"color: {self.theme['muted']}; padding: 2px 4px;")
+            if headers == ["Error"]:
+                message = (rows[0][0] if rows and rows[0] else raw).strip() or "Query failed"
+                message = re.sub(r"^(ERROR|Error|error):\s*", "", message)
+                self.query_raw.setText(f"Error: {message}")
+                self.query_raw.setStyleSheet(f"color: {self.theme['red']}; padding: 2px 4px;")
+                self.status_bar.clearMessage()
+            elif headers in (["Status"], ["Result"]):
+                message = rows[0][0] if rows and rows[0] else "Query OK"
+                message = re.sub(r"\s*\([\d.]+ ms\)$", "", message)
+                self.query_raw.setText(f"{message}  •  {elapsed}")
+                self.status_bar.clearMessage()
+            else:
+                self.query_raw.setText(f"{len(rows)} row(s)  •  {elapsed}")
+                self.status_bar.clearMessage()
+
+        self._run_async(f"Executing query on {c.name}/{db_name}...", _task, _done)
+
+    def _confirm_write_query(self, c: DockerDbContainer, db_name: str, query: str) -> bool:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Run query?")
+        dlg.resize(620, 360)
+        layout = QVBoxLayout(dlg)
+        target = f"{c.name} / {db_name}" if db_name and db_name != c.name else c.name
+        msg = QLabel(f"This query can change data in <b>{target}</b>:")
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+        shown = QPlainTextEdit(query)
+        shown.setReadOnly(True)
+        layout.addWidget(shown, 1)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_run = QPushButton("Run")
+        btn_run.setObjectName("dangerBtn")
+        btn_run.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_run)
+        layout.addLayout(btn_row)
+        btn_cancel.setDefault(True)
+        btn_cancel.setFocus()
+        return dlg.exec() == QDialog.DialogCode.Accepted
+
+    def show_container_menu(self, pos):
+        menu = QMenu(self)
+        c = self.current_container
+        if self.sqlite_path:
+            menu.addAction("Copy Path", lambda: QGuiApplication.clipboard().setText(c.default_db) if c else None)
+            menu.addAction("Open in sqlite3\tCtrl+T", self.open_terminal_shell)
+            menu.addAction("Reload\tCtrl+R", self.refresh_containers)
+            menu.exec(self.container_list.viewport().mapToGlobal(pos))
+            return
+        if c:
+            menu.addAction("Stop Container" if c.running else "Start Container", self.toggle_selected_container)
+            menu.addAction("Copy DSN / URL\tCtrl+Shift+C", self.copy_connection_url)
+            act_cli = menu.addAction("Terminal Shell\tCtrl+T", self.open_terminal_shell)
+            act_cli.setEnabled(c.running)
+            menu.addSeparator()
+        menu.addAction("Rescan Docker\tCtrl+R", self.refresh_containers)
+        menu.addAction("Install DB…", self.launch_omarchy_install_db)
+        menu.exec(self.container_list.viewport().mapToGlobal(pos))
+
+    def toggle_selected_container(self):
+        if not self.current_container:
+            return
+        c = self.current_container
+        action = "Stopping" if c.running else "Starting"
+
+        def _task():
+            return self.backend.toggle_container(c)
+
+        def _done(res):
+            ok, msg = res
+            if not ok and msg:
+                QMessageBox.warning(self, "Docker Error", msg)
+            self.refresh_containers()
+
+        self._run_async(f"{action} container {c.name}...", _task, _done)
+
+    def copy_connection_url(self):
+        if not self.current_container:
+            return
+        url = self.current_container.connection_url
+        QGuiApplication.clipboard().setText(url)
+        self.status_bar.showMessage(f"Copied connection URL to clipboard: {url}")
+
+    def copy_table_as_json(self):
+        if not self.current_headers or not self.current_rows:
+            return
+        records = []
+        for r in self.current_rows:
+            obj = {
+                self.current_headers[i]: (r[i] if i < len(r) else None)
+                for i in range(len(self.current_headers))
+            }
+            records.append(obj)
+        text = json.dumps(records, indent=2, ensure_ascii=False)
+        QGuiApplication.clipboard().setText(text)
+        self.status_bar.showMessage(f"Copied {len(records)} rows as JSON to clipboard.")
+
+    def copy_table_as_csv(self):
+        if not self.current_headers:
+            return
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(self.current_headers)
+        writer.writerows(self.current_rows)
+        QGuiApplication.clipboard().setText(buf.getvalue())
+        self.status_bar.showMessage(f"Copied {len(self.current_rows)} rows as CSV to clipboard.")
+
+    def open_terminal_shell(self):
+        if not self.current_container or not self.current_container.running:
+            return
+        self.backend.open_interactive_terminal(self.current_container, self.current_db)
+
+    def launch_omarchy_install_db(self):
+        subprocess.Popen(
+            ["omarchy-launch-floating-terminal-with-presentation", "omarchy-install-docker-dbs"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _show_cell_inspector(self, col_name: str, value: str):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(col_name)
+        dlg.resize(640, 420)
+        layout = QVBoxLayout(dlg)
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        # Pretty-print JSON if valid
+        formatted = value
+        if value.strip().startswith(("{", "[")):
+            try:
+                formatted = json.dumps(json.loads(value), indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        editor.setPlainText(formatted)
+        layout.addWidget(editor)
+
+        btn_row = QHBoxLayout()
+        btn_copy = QPushButton("󰆏  Copy")
+        btn_copy.clicked.connect(lambda: (QGuiApplication.clipboard().setText(formatted), dlg.accept()))
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_copy)
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+        dlg.exec()
+
+    def inspect_cell_dialog(self, row: int, col: int):
+        item = self.data_table.item(row, col)
+        hdr = self.data_table.horizontalHeaderItem(col)
+        if item:
+            self._show_cell_inspector(hdr.text() if hdr else f"Col {col}", item.text())
+
+    def inspect_query_cell_dialog(self, row: int, col: int):
+        item = self.query_table.item(row, col)
+        hdr = self.query_table.horizontalHeaderItem(col)
+        if item:
+            self._show_cell_inspector(hdr.text() if hdr else f"Col {col}", item.text())
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("omatable")
+    app.setDesktopFileName("omatable")
+    local_icon = os.path.join(os.path.dirname(os.path.realpath(__file__)), "omatable.svg")
+    fallback_icon = QIcon(local_icon) if os.path.exists(local_icon) else QIcon()
+    app.setWindowIcon(QIcon.fromTheme("omatable", fallback_icon))
+    arg = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else ""
+    if arg.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+        arg = unquote(urlparse(arg).path)
+    if arg and os.path.isfile(arg):
+        win = OmatableWindow(sqlite_path=arg)
+    else:
+        win = OmatableWindow(initial_container=arg)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

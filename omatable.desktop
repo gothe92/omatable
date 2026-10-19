@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Omatable
+GenericName=Docker Database Manager
+Comment=Standalone Docker Database Manager & SQL/NoSQL Inspector
+Exec=omatable %f
+Icon=omatable
+Terminal=false
+Categories=Development;Database;Utility;
+MimeType=application/vnd.sqlite3;application/x-sqlite3;
+Keywords=database;docker;sqlite;postgres;mysql;mariadb;redis;mongodb;mssql;sql;omarchy;
+StartupNotify=true
+StartupWMClass=omatable
