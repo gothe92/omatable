@@ -1,20 +1,20 @@
 # Omatable
 
-Browse and query the databases in your Docker containers, plus any SQLite file, from one fast, keyboard-friendly window that feels at home on [Omarchy](https://omarchy.org).
+A database browser for [Omarchy](https://omarchy.org). Browse your Docker databases, query your data, and open SQLite files. All in one window, with your theme and keyboard shortcuts.
 
 ![Omatable browsing a PostgreSQL database](preview.png)
 
 ## Features
 
-- **Zero setup.** Omatable finds every PostgreSQL, MySQL, MariaDB, SQL Server, MongoDB and Redis container on your machine, including ones started with `docker compose` or `omarchy-install-docker-dbs`. It reads ports and credentials from the container itself. No connection strings to type, no database clients to install.
-- **Everything in one tree.** Each container lists its databases, and each database opens to show its tables, collections or keys. Select a database to get an overview of its tables with row counts and sizes, then open one with `Enter` or a double-click. The filter searches across all of them at once.
-- **A data grid that keeps up.** Sort any column, search through the loaded rows, inspect long or JSON values in a cell, and copy results as JSON or CSV.
-- **Query console.** Write SQL, `mongosh` or `redis-cli` commands and see the results right away, with the row count and timing. Every container remembers its own query.
-- **Safe by default.** Before a query that inserts, updates, deletes, creates or drops anything, Omatable shows it to you once more and asks for confirmation.
-- **Container controls.** Right-click a container to start or stop it, copy its connection URL, or open its native CLI (`psql`, `mysql`, `sqlcmd`, `mongosh`, `redis-cli`) in a terminal.
-- **SQLite files.** Open any `.db`, `.sqlite` or `.sqlite3` file in Omatable from "Open with", or make it the default so a double-click does it.
-- **Keyboard first.** Press `Ctrl+P` to jump to any container, database or table by name. Type in the sidebar to filter tables, and open them with `Enter`. You never need the mouse.
-- **Native to Omarchy.** Omatable uses your current theme's colors, accent and font, and matches your Hyprland corner rounding.
+- **Your containers, ready to browse.** Finds supported Docker databases and reads their connection details from the containers. Works with Docker Compose and Omarchy's database containers.
+- **One tree for your data.** Browse databases, tables, views, collections, and Redis keys. See table row counts and sizes before opening them.
+- **Browse, inspect, copy.** Sort columns, search loaded rows, inspect JSON and long values, and copy results as JSON or CSV.
+- **A query console at hand.** Run SQL, `mongosh`, or `redis-cli` commands. See results, row counts, and timing. Each container remembers its last query.
+- **Confirm before writing.** Queries detected as changing data or schema ask for confirmation before running.
+- **Container controls.** Start or stop containers, copy connection URLs, or open a database CLI from the sidebar.
+- **SQLite included.** Open `.db`, `.sqlite`, and `.sqlite3` files from your file manager or the command line.
+- **Made for the keyboard.** Press `Ctrl+P` to jump to a container, database, or table. Type to filter. Press `Enter` to open.
+- **Dressed in your theme.** Uses your Omarchy colors, accent, and font, with corners that follow your Hyprland rounding.
 
 ## Screenshots
 
@@ -37,7 +37,7 @@ Browse and query the databases in your Docker containers, plus any SQLite file, 
 
 ## Install
 
-**As an Omarchy plugin:**
+### Omarchy plugin
 
 ```bash
 omarchy plugin add https://github.com/gothe92/omatable --enable
@@ -49,19 +49,21 @@ Then bind it to a key in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + ALT + SHIFT + D", "Omatable", "omarchy-shell shell summon andras.omatable")
 ```
 
-**As a desktop app:**
+### Desktop app
 
 ```bash
-git clone https://github.com/gothe92/omatable && cd omatable && ./install.sh
+git clone https://github.com/gothe92/omatable
+cd omatable
+./install.sh
 ```
 
-This adds Omatable to the app launcher (`SUPER + SPACE`) and to "Open with" for SQLite files. To also make it the default app for SQLite files:
+Launch Omatable with `SUPER + SPACE`, or choose it from "Open with" for SQLite files. To make it your default SQLite app:
 
 ```bash
 ./install.sh --default-sqlite
 ```
 
-Omatable needs `python-pyqt6`. For containers it also needs `docker`, and your user must be able to run it.
+Requires `python-pyqt6`. Browsing containers also requires Docker access.
 
 ## Usage
 
@@ -97,7 +99,7 @@ Each launch opens a new window, and Omatable stops running when you close it.
 omarchy plugin remove andras.omatable
 ```
 
-Uninstalling removes only Omatable itself. Your databases and containers stay exactly as they are.
+Your databases and containers are left untouched.
 
 ## License
 
