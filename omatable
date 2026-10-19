@@ -1874,6 +1874,7 @@ class OmatableWindow(QMainWindow):
         prev = self.current_container
         if prev is not c:
             # Each container keeps its own query; results never carry over
+            self._channel_latest.pop("query", None)
             if prev is not None:
                 self._queries[prev.name] = self.query_editor.toPlainText()
             self.query_editor.setPlainText(self._queries.get(c.name, ""))
@@ -2028,8 +2029,6 @@ class OmatableWindow(QMainWindow):
 
     def _refresh_sqlite_file(self, c: DockerDbContainer):
         gen = self._tree_gen
-        prev_table = self.current_table
-        prev_tab = self.tabs.currentIndex()
 
         def _task():
             return self.backend.list_databases_and_items(c)
@@ -2037,6 +2036,8 @@ class OmatableWindow(QMainWindow):
         def _done(res):
             if self._tree_gen != gen or self.current_container is not c:
                 return
+            prev_table = self.current_table
+            prev_tab = self.tabs.currentIndex()
             active_db, dbs, items, _ = res
             self._build_schema_tree(c, dbs, active_db, items)
             node = next((n for n in self._table_nodes() if n.data(0, self._ROLE)[2] == prev_table), None)
@@ -2440,6 +2441,8 @@ class OmatableWindow(QMainWindow):
             return res, (time.monotonic() - t0) * 1000
 
         def _done(res):
+            if self.current_container is not c:
+                return
             (headers, rows, raw), elapsed_ms = res
             if headers == ["Error"]:
                 self.query_table.setRowCount(0)
