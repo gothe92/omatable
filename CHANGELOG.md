@@ -11,6 +11,6 @@ First release.
 - Query console with per-container history, row counts and timing.
 - Asks for confirmation before any query that changes data.
 - Container controls: start/stop, copy connection URL, and open the native CLI.
-- Full keyboard navigation.
+- Full keyboard navigation, with `Ctrl+P` to jump straight to any container, database or table.
 - Follows the current Omarchy theme, font and corner rounding.
 - Installs as an Omarchy plugin or as a standalone desktop app.

@@ -1101,6 +1101,101 @@ class AsyncDbWorker(QThread):
 # Standalone PyQt6 Main Window
 # ---------------------------------------------------------------------------
 
+def fuzzy_score(query: str, text: str) -> Optional[int]:
+    """Lower is better; None when the query's letters don't appear in order."""
+    q, t = query.lower(), text.lower()
+    if not q:
+        return 0
+    pos = t.find(q)
+    if pos >= 0:
+        return pos  # plain substring matches win, earlier is better
+    i, gaps, last = 0, 0, -1
+    for j, ch in enumerate(t):
+        if i < len(q) and ch == q[i]:
+            if last >= 0:
+                gaps += j - last - 1
+            last = j
+            i += 1
+    return 1000 + gaps if i == len(q) else None
+
+
+class QuickSwitcher(QDialog):
+    """Ctrl+P: type to jump to a container, database or table."""
+
+    def __init__(self, parent, entries: Callable[[], List[Tuple[str, Any]]], on_pick: Callable[[Any], None]):
+        super().__init__(parent)
+        self.setWindowTitle("Go to")
+        self.resize(560, 420)
+        self._entries = entries
+        self._on_pick = on_pick
+        self._shown: List[Any] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Go to container, database or table")
+        self.search.textChanged.connect(self.refresh)
+        self.search.installEventFilter(self)
+        layout.addWidget(self.search)
+        self.results = QListWidget()
+        self.results.itemActivated.connect(lambda _: self.pick())
+        layout.addWidget(self.results, 1)
+
+        # Tables of other databases arrive in the background; keep the list fresh
+        self._poll = QTimer(self)
+        self._poll.setInterval(400)
+        self._poll.timeout.connect(self._refresh_if_changed)
+        self._poll.start()
+        self._last_count = -1
+        self.refresh()
+
+    def _refresh_if_changed(self):
+        if len(self._entries()) != self._last_count:
+            self.refresh()
+
+    def refresh(self):
+        query = self.search.text().strip()
+        entries = self._entries()
+        self._last_count = len(entries)
+        scored = []
+        for order, (label, key) in enumerate(entries):
+            score = fuzzy_score(query, label)
+            if score is not None:
+                scored.append((score, order, label, key))
+        scored.sort()
+        self.results.clear()
+        self._shown = []
+        for _, _, label, key in scored[:200]:
+            self.results.addItem(label)
+            self._shown.append(key)
+        if self._shown:
+            self.results.setCurrentRow(0)
+
+    def eventFilter(self, obj, event):
+        if obj is self.search and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            row = self.results.currentRow()
+            if key == Qt.Key.Key_Down:
+                self.results.setCurrentRow(min(row + 1, self.results.count() - 1))
+                return True
+            if key == Qt.Key.Key_Up:
+                self.results.setCurrentRow(max(row - 1, 0))
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.pick()
+                return True
+        return super().eventFilter(obj, event)
+
+    def pick(self):
+        row = self.results.currentRow()
+        if 0 <= row < len(self._shown):
+            key = self._shown[row]
+            self.accept()
+            # Run after the dialog has handed focus back, so the jump keeps focus
+            QTimer.singleShot(0, lambda: self._on_pick(key))
+
+
 class OmatableWindow(QMainWindow):
     SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -1378,7 +1473,6 @@ class OmatableWindow(QMainWindow):
                 border: 1px solid {a(fg, 0.15)};
                 border-radius: {r}px;
                 background-color: {bg};
-                top: -1px;
             }}
             QTabBar::tab {{
                 background-color: transparent;
@@ -1387,6 +1481,7 @@ class OmatableWindow(QMainWindow):
                 border: none;
                 border-bottom: 2px solid transparent;
                 margin-right: 2px;
+                margin-bottom: 4px;
                 font-weight: bold;
             }}
             QTabBar::tab:hover {{
@@ -1580,8 +1675,15 @@ class OmatableWindow(QMainWindow):
         tq_layout.addWidget(q_splitter)
         self.tabs.addTab(tab_query, "  Query")
 
-        self.tabs.setCornerWidget(self.btn_run_query, Qt.Corner.TopRightCorner)
-        self.tabs.currentChanged.connect(lambda i: self.btn_run_query.setVisible(i == 2))
+        # Keep Run clear of the pane's top border
+        run_corner = QWidget()
+        run_layout = QHBoxLayout(run_corner)
+        run_layout.setContentsMargins(0, 0, 0, 6)
+        run_layout.addWidget(self.btn_run_query)
+        run_corner.setVisible(False)
+        self.btn_run_query.setVisible(True)
+        self.tabs.setCornerWidget(run_corner, Qt.Corner.TopRightCorner)
+        self.tabs.currentChanged.connect(lambda i: run_corner.setVisible(i == 2))
         l3.addWidget(self.tabs)
         splitter.addWidget(pane_main)
         splitter.setSizes([300, 980])
@@ -1602,6 +1704,8 @@ class OmatableWindow(QMainWindow):
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self.refresh_containers)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.table_filter.setFocus())
+        QShortcut(QKeySequence("Ctrl+P"), self, activated=self.open_quick_switcher)
+        QShortcut(QKeySequence("Ctrl+K"), self, activated=self.open_quick_switcher)
         QShortcut(QKeySequence("/"), self, activated=lambda: self.row_search.setFocus())
         QShortcut(QKeySequence("Ctrl+T"), self, activated=self.open_terminal_shell)
         QShortcut(QKeySequence("Ctrl+Shift+C"), self, activated=self.copy_connection_url)
@@ -2129,6 +2233,61 @@ class OmatableWindow(QMainWindow):
                 self.status_bar.clearMessage()
 
         self._run_async(f"Executing query on {c.name}/{db_name}...", _task, _done)
+
+    def _switcher_entries(self) -> List[Tuple[str, Any]]:
+        entries: List[Tuple[str, Any]] = []
+        tree = self.schema_tree
+        cur = self.current_container
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            data = top.data(0, self._ROLE) or ("", "", "")
+            if data[0] == "table":
+                entries.append((f"󰓫  {data[2]}", ("table", data[1], data[2])))
+                continue
+            for j in range(top.childCount()):
+                cd = top.child(j).data(0, self._ROLE) or ("", "", "")
+                if cd[0] == "table":
+                    entries.append((f"󰓫  {cd[1]} › {cd[2]}", ("table", cd[1], cd[2])))
+            entries.append((f"󰆼  {data[1]}", ("db", data[1], "")))
+        if not self.sqlite_path:
+            for c in self.containers:
+                if c is not cur:
+                    entries.append((f"  {c.name}  ·  {c.engine_label} {c.version}".rstrip(), ("container", c.name, "")))
+        return entries
+
+    def open_quick_switcher(self):
+        # Make every database's tables searchable, not only the opened ones
+        for i in range(self.schema_tree.topLevelItemCount()):
+            self._load_db_node(self.schema_tree.topLevelItem(i))
+        QuickSwitcher(self, self._switcher_entries, self._quick_switch_to).exec()
+
+    def _quick_switch_to(self, key):
+        self.activateWindow()
+        kind, name, table = key
+        tree = self.schema_tree
+        if kind == "container":
+            row = [c.name for c in self.containers].index(name)
+            self.container_list.setCurrentRow(row)
+            self._focus_tables()
+            return
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            data = top.data(0, self._ROLE) or ("", "", "")
+            if kind == "db" and data[0] == "db" and data[1] == name:
+                top.setExpanded(True)
+                tree.setCurrentItem(top)
+                tree.setFocus()
+                return
+            nodes = [top] if data[0] == "table" else [top.child(j) for j in range(top.childCount())]
+            for node in nodes:
+                nd = node.data(0, self._ROLE) or ("", "", "")
+                if nd[0] == "table" and nd[1] == name and nd[2] == table:
+                    if node.parent():
+                        node.parent().setExpanded(True)
+                    self.table_filter.clear()
+                    tree.setCurrentItem(node)
+                    self._open_selected_table()
+                    return
 
     def _confirm_write_query(self, c: DockerDbContainer, db_name: str, query: str) -> bool:
         dlg = QDialog(self)

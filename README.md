@@ -13,7 +13,7 @@ Browse and query the databases in your Docker containers, plus any SQLite file, 
 - **Safe by default.** Before a query that inserts, updates, deletes, creates or drops anything, Omatable shows it to you once more and asks for confirmation.
 - **Container controls.** Right-click a container to start or stop it, copy its connection URL, or open its native CLI (`psql`, `mysql`, `sqlcmd`, `mongosh`, `redis-cli`) in a terminal.
 - **SQLite files.** Double-click any `.db`, `.sqlite` or `.sqlite3` file to open it in Omatable.
-- **Keyboard first.** Jump to a container by typing its name, filter tables as you type, and open them with `Enter`. You never need the mouse.
+- **Keyboard first.** Press `Ctrl+P` to jump to any container, database or table by name. Type in the sidebar to filter tables, and open them with `Enter`. You never need the mouse.
 - **Native to Omarchy.** Omatable uses your current theme's colors, accent and font, and matches your Hyprland corner rounding.
 
 ## Screenshots
@@ -73,6 +73,7 @@ Each launch opens a new window, and Omatable stops running when you close it.
 
 | Key | Action |
 |---|---|
+| `Ctrl+P` | Go to a container, database or table |
 | Type a name | Jump to a container, or filter tables |
 | `Enter` / `→` | Open the selected container, database or table |
 | `Esc` / `←` | Clear the filter or go back one level |
