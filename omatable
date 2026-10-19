@@ -43,6 +43,8 @@ from PyQt6.QtWidgets import (
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -84,6 +86,17 @@ def load_omarchy_theme() -> Dict[str, str]:
     except Exception:
         pass
     return palette
+
+
+def load_hypr_rounding() -> int:
+    """Corner radius used by the Omarchy shell: Hyprland's decoration:rounding."""
+    try:
+        out = subprocess.check_output(
+            ["hyprctl", "-j", "getoption", "decoration:rounding"], stderr=subprocess.DEVNULL, text=True, timeout=2
+        )
+        return max(0, int(json.loads(out).get("int", 0)))
+    except Exception:
+        return 0
 
 
 def load_omarchy_font() -> str:
@@ -1107,6 +1120,7 @@ class OmatableWindow(QMainWindow):
         self.initial_container = initial_container
         self.sqlite_path = sqlite_path
         self._queries: Dict[str, str] = {}
+        self._filter_expanded: List[Any] = []
 
         self._req_counter = 0
         self._active_workers: Dict[int, AsyncDbWorker] = {}
@@ -1126,7 +1140,7 @@ class OmatableWindow(QMainWindow):
         self._table_load_timer.setSingleShot(True)
         self._table_load_timer.setInterval(180)
         self._table_load_timer.timeout.connect(self.reload_current_table)
-        for w in (self.container_list, self.items_list, self.table_filter, self.data_table):
+        for w in (self.container_list, self.schema_tree, self.table_filter, self.data_table):
             w.installEventFilter(self)
         self.container_list.setFocus()
         self._tune_scrolling()
@@ -1152,10 +1166,41 @@ class OmatableWindow(QMainWindow):
                 f.write(
                     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8">'
                     f'<path d="M1 1.5l5 5 5-5" fill="none" stroke="{muted}" stroke-width="1.6" '
-                    'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+                    'stroke-linecap="square" stroke-linejoin="miter"/></svg>'
                 )
         except OSError:
             pass
+        chevron_down_path = os.path.join(tempfile.gettempdir(), f"omatable-chevron-down-{os.getuid()}.svg")
+        try:
+            with open(chevron_down_path, "w") as f:
+                f.write(
+                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+                    f'<path d="M7.5 10l4.5 4.5 4.5-4.5" fill="none" stroke="{muted}" stroke-width="1.6" '
+                    'stroke-linecap="square" stroke-linejoin="miter"/></svg>'
+                )
+        except OSError:
+            pass
+        chevron_right_path = os.path.join(tempfile.gettempdir(), f"omatable-chevron-right-{os.getuid()}.svg")
+        try:
+            with open(chevron_right_path, "w") as f:
+                f.write(
+                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+                    f'<path d="M10 7.5l4.5 4.5-4.5 4.5" fill="none" stroke="{muted}" stroke-width="1.6" '
+                    'stroke-linecap="square" stroke-linejoin="miter"/></svg>'
+                )
+        except OSError:
+            pass
+
+        # Omarchy design language: corners follow Hyprland's rounding, controls
+        # are outlined with translucent foreground, selection uses the accent
+        accent = self.theme.get("accent", blue)
+        urgent = self.theme["red"]
+        r = load_hypr_rounding()
+        ri = max(0, r - 2)
+
+        def a(color: str, alpha: float) -> str:
+            c = QColor(color)
+            return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha})"
 
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
@@ -1164,59 +1209,76 @@ class OmatableWindow(QMainWindow):
                 font-family: "{self.font_family}", monospace;
                 font-size: 13px;
             }}
-            QListWidget {{
-                background-color: {dark_bg};
-                border: 1px solid {lighter_bg};
-                border-radius: 6px;
+            QListWidget, QTreeWidget {{
+                background-color: {bg};
+                border: 1px solid {a(fg, 0.15)};
+                border-radius: {r}px;
                 padding: 4px;
                 outline: none;
             }}
-            QListWidget::item {{
+            QListWidget::item, QTreeWidget::item {{
                 padding: 8px 10px;
-                border-radius: 4px;
+                border-radius: {ri}px;
                 margin-bottom: 2px;
             }}
-            QListWidget::item:selected {{
-                background-color: {sel_bg};
-                color: #ffffff;
-                font-weight: bold;
+            QListWidget::item:hover, QTreeWidget::item:hover {{
+                background-color: {a(fg, 0.08)};
             }}
-            QListWidget::item:hover {{
-                background-color: {lighter_bg};
+            QListWidget::item:selected, QTreeWidget::item:selected {{
+                background-color: {a(fg, 0.12)};
+                color: {accent};
+            }}
+            QTreeWidget {{
+                show-decoration-selected: 0;
+            }}
+            QTreeWidget::branch, QTreeWidget::branch:selected, QTreeWidget::branch:hover {{
+                background: transparent;
+                border: none;
+            }}
+            QTreeWidget::branch:has-children:closed {{
+                image: url({chevron_right_path});
+            }}
+            QTreeWidget::branch:has-children:open {{
+                image: url({chevron_down_path});
             }}
             QTableWidget {{
-                background-color: {darker_bg};
-                alternate-background-color: {dark_bg};
-                gridline-color: {lighter_bg};
-                border: 1px solid {lighter_bg};
-                border-radius: 6px;
-                selection-background-color: {sel_bg};
-                selection-color: #ffffff;
+                background-color: {bg};
+                alternate-background-color: {a(fg, 0.025)};
+                gridline-color: {a(fg, 0.08)};
+                border: 1px solid {a(fg, 0.15)};
+                border-radius: {r}px;
+                selection-background-color: {a(fg, 0.18)};
+                selection-color: {accent};
             }}
             QHeaderView::section {{
-                background-color: {lighter_bg};
+                background-color: {a(fg, 0.06)};
                 color: {fg};
                 font-weight: bold;
                 padding: 6px 10px;
                 border: none;
-                border-right: 1px solid {dark_bg};
-                border-bottom: 1px solid {dark_bg};
+                border-right: 1px solid {a(fg, 0.08)};
+                border-bottom: 1px solid {a(fg, 0.15)};
+            }}
+            QTableCornerButton::section {{
+                background-color: {a(fg, 0.06)};
+                border: none;
             }}
             QLineEdit, QComboBox, QPlainTextEdit {{
-                background-color: {dark_bg};
+                background-color: {a(fg, 0.04)};
                 color: {fg};
-                border: 1px solid {lighter_bg};
-                border-radius: 5px;
+                border: 1px solid {a(fg, 0.4)};
+                border-radius: {r}px;
                 padding: 6px 10px;
+                selection-background-color: {a(fg, 0.35)};
+            }}
+            QLineEdit:hover, QComboBox:hover, QPlainTextEdit:hover {{
+                background-color: {a(fg, 0.08)};
             }}
             QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
-                border: 1px solid {blue};
+                border: 1px solid {accent};
             }}
             QComboBox {{
                 padding-right: 28px;
-            }}
-            QComboBox:hover {{
-                border: 1px solid {muted};
             }}
             QComboBox::drop-down {{
                 subcontrol-origin: padding;
@@ -1230,46 +1292,42 @@ class OmatableWindow(QMainWindow):
                 width: 12px;
                 height: 8px;
             }}
-            QComboBox::down-arrow:on {{
-                top: 1px;
-            }}
             QComboBox QAbstractItemView {{
-                background-color: {dark_bg};
+                background-color: {bg};
                 color: {fg};
-                border: 1px solid {lighter_bg};
-                border-radius: 6px;
+                border: 1px solid {fg};
+                border-radius: {r}px;
                 padding: 4px;
                 outline: none;
-                selection-background-color: {sel_bg};
-                selection-color: {fg};
+                selection-background-color: {a(fg, 0.08)};
+                selection-color: {accent};
             }}
             QComboBox QAbstractItemView::item {{
                 min-height: 26px;
                 padding: 2px 8px;
-                border-radius: 4px;
             }}
             QScrollBar:vertical {{
                 background: transparent;
-                width: 10px;
+                width: 8px;
                 margin: 2px;
             }}
             QScrollBar:horizontal {{
                 background: transparent;
-                height: 10px;
+                height: 8px;
                 margin: 2px;
             }}
             QScrollBar::handle:vertical {{
-                background: {muted};
-                border-radius: 3px;
+                background: {a(fg, 0.25)};
+                border-radius: {ri}px;
                 min-height: 32px;
             }}
             QScrollBar::handle:horizontal {{
-                background: {muted};
-                border-radius: 3px;
+                background: {a(fg, 0.25)};
+                border-radius: {ri}px;
                 min-width: 32px;
             }}
             QScrollBar::handle:hover {{
-                background: {blue};
+                background: {accent};
             }}
             QScrollBar::add-line, QScrollBar::sub-line {{
                 width: 0px;
@@ -1284,77 +1342,90 @@ class OmatableWindow(QMainWindow):
                 background: transparent;
             }}
             QPushButton {{
-                background-color: {lighter_bg};
+                background-color: {a(fg, 0.04)};
                 color: {fg};
-                border: 1px solid {muted};
-                border-radius: 5px;
+                border: 1px solid {a(fg, 0.4)};
+                border-radius: {r}px;
                 padding: 6px 12px;
                 font-weight: 600;
             }}
             QPushButton:hover {{
-                background-color: {sel_bg};
-                border-color: {blue};
+                background-color: {a(fg, 0.08)};
+                border-color: {a(fg, 0.25)};
+            }}
+            QPushButton:pressed {{
+                background-color: {a(fg, 0.22)};
+            }}
+            QPushButton:focus {{
+                border-color: {accent};
             }}
             QPushButton#primaryBtn {{
-                background-color: {blue};
-                color: {darker_bg};
-                border: none;
+                background-color: {accent};
+                color: {bg};
+                border: 1px solid {accent};
             }}
             QPushButton#dangerBtn {{
-                background-color: {self.theme["red"]};
-                color: {darker_bg};
-                border: none;
+                background-color: {urgent};
+                color: {bg};
+                border: 1px solid {urgent};
             }}
             QPushButton#successBtn {{
                 background-color: {green};
-                color: {darker_bg};
-                border: none;
+                color: {bg};
+                border: 1px solid {green};
             }}
             QTabWidget::pane {{
-                border: 1px solid {lighter_bg};
-                border-radius: 6px;
+                border: 1px solid {a(fg, 0.15)};
+                border-radius: {r}px;
                 background-color: {bg};
+                top: -1px;
             }}
             QTabBar::tab {{
-                background-color: {dark_bg};
+                background-color: transparent;
                 color: {muted};
                 padding: 8px 16px;
-                border-top-left-radius: 5px;
-                border-top-right-radius: 5px;
-                margin-right: 4px;
+                border: none;
+                border-bottom: 2px solid transparent;
+                margin-right: 2px;
                 font-weight: bold;
             }}
-            QTabBar::tab:selected {{
-                background-color: {lighter_bg};
+            QTabBar::tab:hover {{
                 color: {fg};
-                border-bottom: 2px solid {blue};
+                background-color: {a(fg, 0.08)};
+            }}
+            QTabBar::tab:selected {{
+                color: {accent};
+                border-bottom: 2px solid {accent};
             }}
             QMenu {{
-                background-color: {dark_bg};
+                background-color: {bg};
                 color: {fg};
-                border: 1px solid {lighter_bg};
-                border-radius: 6px;
+                border: 1px solid {fg};
+                border-radius: {r}px;
                 padding: 4px;
             }}
             QMenu::item {{
                 padding: 6px 24px 6px 12px;
-                border-radius: 4px;
             }}
             QMenu::item:selected {{
-                background-color: {sel_bg};
+                background-color: {a(fg, 0.08)};
+                color: {accent};
             }}
             QMenu::item:disabled {{
                 color: {muted};
             }}
             QMenu::separator {{
                 height: 1px;
-                background: {lighter_bg};
+                background: {a(fg, 0.15)};
                 margin: 4px 6px;
             }}
             QStatusBar {{
-                background-color: {darker_bg};
+                background-color: {bg};
                 color: {muted};
-                border-top: 1px solid {lighter_bg};
+                border-top: 1px solid {a(fg, 0.15)};
+            }}
+            QSplitter::handle {{
+                background: transparent;
             }}
         """)
 
@@ -1387,24 +1458,24 @@ class OmatableWindow(QMainWindow):
         l2.setContentsMargins(0, 6, 0, 0)
         l2.setSpacing(6)
 
-        self.db_combo = QComboBox()
-        self.db_combo.currentTextChanged.connect(self.on_database_changed)
-        l2.addWidget(self.db_combo)
-
         self.table_filter = QLineEdit()
         self.table_filter.setPlaceholderText("Filter")
-        self.table_filter.textChanged.connect(self.populate_items_list)
+        self.table_filter.textChanged.connect(self.apply_tree_filter)
         l2.addWidget(self.table_filter)
 
-        self.items_list = QListWidget()
-        self.items_list.currentRowChanged.connect(self.on_item_selected)
-        l2.addWidget(self.items_list)
+        # Databases as expandable nodes; their tables load when opened
+        self.schema_tree = QTreeWidget()
+        self.schema_tree.setHeaderHidden(True)
+        self.schema_tree.setIndentation(16)
+        self.schema_tree.setExpandsOnDoubleClick(True)
+        self.schema_tree.currentItemChanged.connect(self.on_tree_current_changed)
+        self.schema_tree.itemExpanded.connect(self.on_tree_expanded)
+        l2.addWidget(self.schema_tree)
         sidebar.addWidget(pane_schema)
         sidebar.setSizes([260, 520])
 
         if self.sqlite_path:
-            # A single file: show just its name on top, no database picker
-            self.db_combo.setVisible(False)
+            # A single file: show just its name on top, its tables below
             self.container_list.setFixedHeight(64)
             self.container_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.container_list.setToolTip(os.path.abspath(self.sqlite_path))
@@ -1549,6 +1620,8 @@ class OmatableWindow(QMainWindow):
     def _tick_spinner(self):
         if not self._active_workers:
             self._spinner_timer.stop()
+            if self.status_bar.currentMessage()[:1] in self.SPINNER_FRAMES:
+                self.status_bar.clearMessage()
             return
         self._spinner_idx = (self._spinner_idx + 1) % len(self.SPINNER_FRAMES)
         frame = self.SPINNER_FRAMES[self._spinner_idx]
@@ -1563,8 +1636,11 @@ class OmatableWindow(QMainWindow):
                 self._spinner_timer.start()
         elif not self._active_workers:
             self._spinner_timer.stop()
+            # Don't leave a finished task's spinner text behind
+            if self.status_bar.currentMessage()[:1] in self.SPINNER_FRAMES:
+                self.status_bar.clearMessage()
 
-    def _run_async(self, label: str, fn: Callable[[], Any], on_done: Callable[[Any], None]):
+    def _run_async(self, label: str, fn: Callable[[], Any], on_done: Callable[[Any], None], exclusive: bool = True):
         # In headless unit tests when window is not shown, run synchronously
         if not self.isVisible():
             self._set_loading(True, label)
@@ -1586,7 +1662,7 @@ class OmatableWindow(QMainWindow):
             self._active_workers.pop(r_id, None)
             self._set_loading(False)
             # Only apply if this is the latest request or no newer request superseded it
-            if r_id == self._req_counter:
+            if not exclusive or r_id == self._req_counter:
                 try:
                     on_done(result)
                 except Exception as exc:
@@ -1659,8 +1735,7 @@ class OmatableWindow(QMainWindow):
                 self.on_container_selected(selected_idx)
             else:
                 self.current_container = None
-                self.db_combo.clear()
-                self.items_list.clear()
+                self.schema_tree.clear()
                 self.status_bar.showMessage("No database containers")
 
         self._run_async("Scanning Docker containers...", _task, _done)
@@ -1687,10 +1762,7 @@ class OmatableWindow(QMainWindow):
         self.tabs.setTabVisible(1, has_structure)
 
         if not c.running:
-            self.db_combo.blockSignals(True)
-            self.db_combo.clear()
-            self.db_combo.blockSignals(False)
-            self.items_list.clear()
+            self.schema_tree.clear()
             self.data_table.setRowCount(0)
             self.data_table.setColumnCount(0)
             self.struct_table.setRowCount(0)
@@ -1698,89 +1770,169 @@ class OmatableWindow(QMainWindow):
             self.status_bar.showMessage(f"{c.name} is stopped")
             return
 
-        # Show immediate loading placeholder in the middle pane
-        self.items_list.blockSignals(True)
-        self.items_list.clear()
-        self.items_list.blockSignals(False)
+        self.schema_tree.blockSignals(True)
+        self.schema_tree.clear()
+        self.schema_tree.blockSignals(False)
 
         def _task():
             return self.backend.list_databases_and_items(c)
 
         def _done(res):
+            if self.current_container is not c:
+                return
             active_db, dbs, items, summary = res
             self.current_db = active_db
             self.current_items = items
-
-            self.db_combo.blockSignals(True)
-            self.db_combo.clear()
-            self.db_combo.addItems(dbs)
-            if active_db in dbs:
-                self.db_combo.setCurrentText(active_db)
-            self.db_combo.blockSignals(False)
-
-            self.populate_items_list()
+            self._build_schema_tree(c, dbs, active_db, items)
             self.status_bar.showMessage(f"Connected to {c.name}  •  {summary}  •  {c.connection_url}")
 
         self._run_async(f"Connecting to {c.name} ({c.engine_label})...", _task, _done)
 
-    def on_database_changed(self, db_name: str):
-        if not self.current_container or not db_name:
-            return
-        self.current_db = db_name
-        c = self.current_container
+    # -----------------------------------------------------------------------
+    # Schema tree: databases → tables / keys / collections
+    # -----------------------------------------------------------------------
 
-        self.items_list.blockSignals(True)
-        self.items_list.clear()
-        self.items_list.blockSignals(False)
+    _ROLE = Qt.ItemDataRole.UserRole
+
+    def _table_node(self, db: str, it: Dict[str, str]) -> QTreeWidgetItem:
+        cnt = it.get("count", "")
+        extra = it.get("extra", "")
+        meta = f"  ({cnt}{', ' + extra if extra else ''})" if cnt else ""
+        node = QTreeWidgetItem([f"󰓫  {it.get('name', '')}{meta}"])
+        node.setData(0, self._ROLE, ("table", db, it.get("name", "")))
+        return node
+
+    def _fill_db_node(self, node: QTreeWidgetItem, db: str, items: List[Dict[str, str]]):
+        node.takeChildren()
+        for it in items:
+            node.addChild(self._table_node(db, it))
+        if not items:
+            empty = QTreeWidgetItem(["No tables"])
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            empty.setData(0, self._ROLE, ("empty", db, ""))
+            node.addChild(empty)
+        node.setData(0, self._ROLE, ("db", db, "loaded"))
+
+    def _build_schema_tree(self, c: DockerDbContainer, dbs: List[str], active_db: str, items: List[Dict[str, str]]):
+        tree = self.schema_tree
+        tree.blockSignals(True)
+        tree.clear()
+        self._filter_expanded = []
+        if c.engine == "sqlite":
+            # One file is one database: list its tables directly
+            for it in items:
+                tree.addTopLevelItem(self._table_node(active_db, it))
+        else:
+            for db in dbs:
+                node = QTreeWidgetItem([f"󰆼  {db}"])
+                if db == active_db:
+                    self._fill_db_node(node, db, items)
+                else:
+                    node.setData(0, self._ROLE, ("db", db, ""))
+                    loading = QTreeWidgetItem(["…"])
+                    loading.setFlags(Qt.ItemFlag.NoItemFlags)
+                    node.addChild(loading)
+                tree.addTopLevelItem(node)
+                if db == active_db:
+                    node.setExpanded(True)
+        tree.blockSignals(False)
+        self.apply_tree_filter()
+
+    def on_tree_expanded(self, node: QTreeWidgetItem):
+        self._load_db_node(node)
+
+    def _load_db_node(self, node: QTreeWidgetItem):
+        data = node.data(0, self._ROLE)
+        if not data or data[0] != "db" or data[2] == "loaded" or not self.current_container:
+            return
+        c = self.current_container
+        db = data[1]
+        node.setData(0, self._ROLE, ("db", db, "loading"))
 
         def _task():
-            return self.backend.list_databases_and_items(c, db_name)
+            return self.backend.list_databases_and_items(c, db)
 
         def _done(res):
-            _, _, items, summary = res
-            self.current_items = items
-            self.populate_items_list()
-            self.status_bar.showMessage(f"{c.name} / {db_name}  •  {summary}")
+            if self.current_container is not c:
+                return
+            self._fill_db_node(node, db, res[2])
+            self.apply_tree_filter()
 
-        self._run_async(f"Loading database {c.name}/{db_name}...", _task, _done)
+        self._run_async(f"Loading {c.name}/{db}...", _task, _done, exclusive=False)
 
-    def populate_items_list(self):
+    def _table_nodes(self):
+        tree = self.schema_tree
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            kind = (top.data(0, self._ROLE) or ("",))[0]
+            if kind == "table":
+                yield top
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if (child.data(0, self._ROLE) or ("",))[0] == "table":
+                    yield child
+
+    def apply_tree_filter(self):
         flt = self.table_filter.text().strip().lower()
-        self.items_list.blockSignals(True)
-        self.items_list.clear()
-        self._filtered_items: List[Dict[str, str]] = []
-
-        for it in self.current_items:
-            name = it.get("name", "")
-            if flt and flt not in name.lower():
+        tree = self.schema_tree
+        if not flt and self._filter_expanded:
+            # Fold back what the filter opened, except where the selection is
+            cur = tree.currentItem()
+            keep = cur.parent() if cur is not None and cur.parent() is not None else cur
+            for node in self._filter_expanded:
+                if node is not keep:
+                    node.setExpanded(False)
+        if not flt:
+            self._filter_expanded = []
+        if flt:
+            # Search every database, not just the ones opened so far
+            for i in range(tree.topLevelItemCount()):
+                self._load_db_node(tree.topLevelItem(i))
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            data = top.data(0, self._ROLE) or ("", "", "")
+            if data[0] == "table":
+                top.setHidden(bool(flt) and flt not in data[2].lower())
                 continue
-            self._filtered_items.append(it)
-            cnt = it.get("count", "")
-            extra = it.get("extra", "")
-            meta = f"  ({cnt}{', ' + extra if extra else ''})" if cnt else ""
-            self.items_list.addItem(f"󰓫  {name}{meta}")
+            db_match = not flt or flt in data[1].lower()
+            any_child = False
+            for j in range(top.childCount()):
+                child = top.child(j)
+                cdata = child.data(0, self._ROLE) or ("", "", "")
+                visible = db_match or (cdata[0] == "table" and flt in cdata[2].lower())
+                child.setHidden(not visible)
+                any_child = any_child or (visible and cdata[0] == "table")
+            top.setHidden(not (db_match or any_child))
+            if flt and any_child and not top.isExpanded():
+                top.setExpanded(True)
+                self._filter_expanded.append(top)
 
-        if not self._filtered_items:
-            empty = QListWidgetItem("No tables" if not flt else "No matching tables")
-            empty.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.items_list.addItem(empty)
-        self.items_list.blockSignals(False)
-        if self._filtered_items:
-            self.items_list.blockSignals(True)
-            self.items_list.setCurrentRow(0)
-            self.items_list.blockSignals(False)
-            self.on_item_selected(0)
-        else:
-            self.data_table.setRowCount(0)
-            self.data_table.setColumnCount(0)
-            self.struct_table.setRowCount(0)
-            self.struct_table.setColumnCount(0)
+        cur = tree.currentItem()
+        cur_kind = (cur.data(0, self._ROLE) or ("",))[0] if cur else ""
+        if cur is None or cur.isHidden() or (cur.parent() and cur.parent().isHidden()) or (flt and cur_kind != "table"):
+            first = next((n for n in self._table_nodes() if not n.isHidden() and not (n.parent() and n.parent().isHidden())), None)
+            if first is not None:
+                tree.setCurrentItem(first)
+            elif cur is None:
+                self.data_table.setRowCount(0)
+                self.data_table.setColumnCount(0)
+                self.struct_table.setRowCount(0)
+                self.struct_table.setColumnCount(0)
 
-    def on_item_selected(self, row: int):
-        if not hasattr(self, "_filtered_items") or row < 0 or row >= len(self._filtered_items):
+    def on_tree_current_changed(self, cur: QTreeWidgetItem, _prev=None):
+        if cur is None:
             return
-        item = self._filtered_items[row]
-        self.current_table = item["name"]
+        data = cur.data(0, self._ROLE)
+        if not data:
+            return
+        kind, db, name = data
+        if kind == "db":
+            self.current_db = db
+            return
+        if kind != "table":
+            return
+        self.current_db = db
+        self.current_table = name
         # Wait for typing / arrow-key runs to settle before querying
         self._table_load_timer.start()
 
@@ -1801,12 +1953,21 @@ class OmatableWindow(QMainWindow):
                 self._focus_tables()
                 return True
 
-        elif obj is self.items_list:
-            if enter or key == Qt.Key.Key_Right:
+        elif obj is self.schema_tree:
+            cur = self.schema_tree.currentItem()
+            kind = (cur.data(0, self._ROLE) or ("",))[0] if cur else ""
+            if enter:
+                if kind == "db":
+                    cur.setExpanded(not cur.isExpanded())
+                else:
+                    self._open_selected_table()
+                return True
+            if key == Qt.Key.Key_Right and kind == "table":
                 self._open_selected_table()
                 return True
-            if key in (Qt.Key.Key_Escape, Qt.Key.Key_Left):
-                if self.table_filter.text():
+            at_top = cur is None or (cur.parent() is None and not cur.isExpanded())
+            if key == Qt.Key.Key_Escape or (key == Qt.Key.Key_Left and at_top):
+                if key == Qt.Key.Key_Escape and self.table_filter.text():
                     self.table_filter.clear()
                 elif not self.sqlite_path:
                     self.container_list.setFocus()
@@ -1821,7 +1982,7 @@ class OmatableWindow(QMainWindow):
 
         elif obj is self.table_filter:
             if key in (Qt.Key.Key_Down, Qt.Key.Key_Up):
-                self.items_list.setFocus()
+                self.schema_tree.setFocus()
                 return True
             if enter:
                 self._open_selected_table()
@@ -1830,26 +1991,30 @@ class OmatableWindow(QMainWindow):
                 if self.table_filter.text():
                     self.table_filter.clear()
                 else:
-                    self.items_list.setFocus()
+                    self.schema_tree.setFocus()
                 return True
 
         elif obj is self.data_table:
             if key == Qt.Key.Key_Escape:
-                self.items_list.setFocus()
+                self.schema_tree.setFocus()
                 return True
 
         return super().eventFilter(obj, event)
 
     def _focus_tables(self):
-        self.items_list.setFocus()
-        if self.items_list.currentRow() < 0 and getattr(self, "_filtered_items", None):
-            self.items_list.setCurrentRow(0)
+        self.schema_tree.setFocus()
+        if self.schema_tree.currentItem() is None:
+            first = next(self._table_nodes(), None)
+            if first is not None:
+                self.schema_tree.setCurrentItem(first)
 
     def _open_selected_table(self):
-        if not getattr(self, "_filtered_items", None):
-            return
-        if self.items_list.currentRow() < 0:
-            self.items_list.setCurrentRow(0)
+        cur = self.schema_tree.currentItem()
+        if cur is None or (cur.data(0, self._ROLE) or ("",))[0] != "table":
+            first = next((n for n in self._table_nodes() if not n.isHidden()), None)
+            if first is None:
+                return
+            self.schema_tree.setCurrentItem(first)
         if self._table_load_timer.isActive():
             self._table_load_timer.stop()
             self.reload_current_table()

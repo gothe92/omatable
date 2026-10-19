@@ -19,7 +19,7 @@ Containers are discovered automatically, whether they come from `docker compose`
 
 ## Using it
 
-**Sidebar.** Containers are listed at the top, each showing only its name and engine version; stopped containers are dimmed. Below them are the database picker, a filter and the tables, keys or collections of the selected database. Omatable opens on your own database rather than a system one (`postgres`, `admin`, `master`).
+**Sidebar.** Containers are listed at the top, each showing only its name and engine version; stopped containers are dimmed. Below them are a filter and a tree of databases. Open a database to list its tables, keys or collections; they load the first time you open it. Omatable starts with your own database open rather than a system one (`postgres`, `admin`, `master`). The filter searches table and database names across every database in the container.
 
 **Right-click a container** for:
 
@@ -43,11 +43,11 @@ Containers are discovered automatically, whether they come from `docker compose`
 
 Browsing tables never asks.
 
-**SQLite files.** When you open a file, the sidebar shows just the file name and SQLite version on top, with no database picker, and its tables and views below. Right-click the name to copy its path, reload it, or open it in `sqlite3`.
+**SQLite files.** When you open a file, the sidebar shows just the file name and SQLite version on top, and its tables and views directly below. Right-click the name to copy its path, reload it, or open it in `sqlite3`.
 
 **Status bar.** While something loads, a spinner and a short message appear in the bottom-left corner; nothing else moves.
 
-**Look.** Omatable follows the active Omarchy theme colors and font, with thin scrollbars and smooth, per-pixel scrolling.
+**Look.** Omatable follows the Omarchy design language: the active theme's colors, accent and font, and corners that match Hyprland's `decoration:rounding` (square by default). Controls have thin translucent outlines, the selection is shown in the accent color, and scrolling is smooth and per-pixel.
 
 ## Screenshots
 
@@ -116,7 +116,7 @@ Uninstalling removes only the files Omatable installed and its own SQLite defaul
 You can do everything without the mouse:
 
 1. **Containers** have focus when Omatable opens. Type a few letters to jump to a container, then press `Enter` (or `→`).
-2. **Tables:** start typing to filter them; the filter fills in as you type. Use `↑` / `↓` to move and `Enter` (or `→`) to open the table in the Data tab.
+2. **Databases and tables:** start typing to filter them; the filter fills in as you type. Use `↑` / `↓` to move, and `→` / `←` to open or close a database. `Enter` opens or closes a database, or opens a table in the Data tab.
 3. **Data grid:** `Esc` goes back to the tables. In the tables, `Esc` clears the filter first, and pressing it again goes back to the containers (`←` also works).
 
 Moving through tables with the arrow keys loads each one after a short pause, so holding a key down doesn't fire a query for every row.
