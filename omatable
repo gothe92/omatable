@@ -2233,7 +2233,8 @@ class OmatableWindow(QMainWindow):
 
     def _load_db_node(self, node: QTreeWidgetItem):
         data = node.data(0, self._ROLE)
-        if not data or data[0] != "db" or data[2] == "loaded" or not self.current_container:
+        # "loading" too: filtering calls this on every keystroke and after every finished load
+        if not data or data[0] != "db" or data[2] in ("loaded", "loading") or not self.current_container:
             return
         c = self.current_container
         db = data[1]
