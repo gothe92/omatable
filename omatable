@@ -81,11 +81,48 @@ def load_omarchy_theme() -> Dict[str, str]:
         for line in out.splitlines():
             if "\t" in line:
                 k, v = line.split("\t", 1)
-                if v.startswith("#"):
-                    palette[k.strip()] = v.strip()
+                v = v.strip()
+                if re.fullmatch(r"#[0-9A-Fa-f]{3,8}", v):
+                    palette[k.strip()] = v
     except Exception:
         pass
     return palette
+
+
+_PRIVATE_DIR: Optional[str] = None
+
+
+def private_dir() -> str:
+    """A directory only this user can use: $XDG_RUNTIME_DIR/omatable, or a fresh
+    mkdtemp() directory. Never a fixed, guessable name in the shared /tmp."""
+    global _PRIVATE_DIR
+    if _PRIVATE_DIR:
+        return _PRIVATE_DIR
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and os.path.isdir(runtime):
+        path = os.path.join(runtime, "omatable")
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(path)
+        if not os.path.islink(path) and os.path.isdir(path) and st.st_uid == os.getuid() and not (st.st_mode & 0o077):
+            _PRIVATE_DIR = path
+            return path
+    _PRIVATE_DIR = tempfile.mkdtemp(prefix="omatable-")
+    return _PRIVATE_DIR
+
+
+def write_private_file(name: str, content: str) -> str:
+    """Write a small file into private_dir() without following symlinks."""
+    path = os.path.join(private_dir(), name)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+    except OSError:
+        pass
+    return path
 
 
 def load_hypr_rounding() -> int:
@@ -616,9 +653,17 @@ class DockerDbBackend:
             args += ["-D", db]
         return args
 
+    @staticmethod
+    def _pg_dbname(db: str) -> str:
+        """psql reads a -d value containing '=' as a connection string (host=, port=, ...).
+        Database names are server data, so always hand psql a quoted conninfo."""
+        escaped = db.replace("\\", "\\\\").replace("'", "\\'")
+        return f"dbname='{escaped}'"
+
     def _pg_exec_args(self, c: DockerDbContainer, db: str = "") -> List[str]:
         args = ["exec", *self._secret_flags(c)]
-        args += [c.name, "psql", "-U", c.user or "postgres", "-d", db or c.default_db or "postgres", "-P", "pager=off"]
+        args += [c.name, "psql", "-U", c.user or "postgres", "-d", self._pg_dbname(db or c.default_db or "postgres"),
+                 "-P", "pager=off"]
         return args
 
     def _mssql_exec_args(self, c: DockerDbContainer, db: str = "", headers: bool = True) -> List[str]:
@@ -1106,11 +1151,14 @@ class DockerDbBackend:
                 if target_db:
                     argv += ["-D", target_db]
             elif c.engine == "postgres":
-                argv += ["psql", "-U", c.user or "postgres", "-d", target_db or "postgres"]
+                argv += ["psql", "-U", c.user or "postgres", "-d", self._pg_dbname(target_db or "postgres")]
             elif c.engine == "redis":
                 argv += ["redis-cli", "-n", target_db if target_db.isdigit() else "0"]
             elif c.engine == "mongodb":
-                argv += ["mongosh", target_db or "admin", "--quiet", "--eval", self.MONGO_AUTH_JS, "--shell"]
+                env["OMATABLE_DB"] = target_db or "admin"
+                argv[3:3] = ["-e", "OMATABLE_DB"]
+                argv += ["mongosh", "--quiet", "--eval",
+                         self.MONGO_AUTH_JS + "db = db.getSiblingDB(process.env.OMATABLE_DB);", "--shell"]
             elif c.engine == "mssql":
                 self._mssql_exec_args(c, target_db)  # resolves the sqlcmd path
                 argv += [self._sqlcmd_paths[c.name], "-C", "-S", "localhost", "-U", c.user or "sa",
@@ -1309,37 +1357,19 @@ class OmatableWindow(QMainWindow):
         cyan = self.theme["cyan"]
         green = self.theme["green"]
 
-        # Qt stylesheets can only draw the combo arrow from an image file
-        chevron_path = os.path.join(tempfile.gettempdir(), f"omatable-chevron-{os.getuid()}.svg")
-        try:
-            with open(chevron_path, "w") as f:
-                f.write(
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8">'
-                    f'<path d="M1 1.5l5 5 5-5" fill="none" stroke="{muted}" stroke-width="1.6" '
-                    'stroke-linecap="square" stroke-linejoin="miter"/></svg>'
-                )
-        except OSError:
-            pass
-        chevron_down_path = os.path.join(tempfile.gettempdir(), f"omatable-chevron-down-{os.getuid()}.svg")
-        try:
-            with open(chevron_down_path, "w") as f:
-                f.write(
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-                    f'<path d="M7.5 10l4.5 4.5 4.5-4.5" fill="none" stroke="{muted}" stroke-width="1.6" '
-                    'stroke-linecap="square" stroke-linejoin="miter"/></svg>'
-                )
-        except OSError:
-            pass
-        chevron_right_path = os.path.join(tempfile.gettempdir(), f"omatable-chevron-right-{os.getuid()}.svg")
-        try:
-            with open(chevron_right_path, "w") as f:
-                f.write(
-                    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
-                    f'<path d="M10 7.5l4.5 4.5-4.5 4.5" fill="none" stroke="{muted}" stroke-width="1.6" '
-                    'stroke-linecap="square" stroke-linejoin="miter"/></svg>'
-                )
-        except OSError:
-            pass
+        # Qt stylesheets can only draw arrows from image files
+        chevron_path = write_private_file("chevron.svg",
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 8">'
+            f'<path d="M1 1.5l5 5 5-5" fill="none" stroke="{muted}" stroke-width="1.6" '
+            'stroke-linecap="square" stroke-linejoin="miter"/></svg>')
+        chevron_down_path = write_private_file("chevron-down.svg",
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+            f'<path d="M7.5 10l4.5 4.5 4.5-4.5" fill="none" stroke="{muted}" stroke-width="1.6" '
+            'stroke-linecap="square" stroke-linejoin="miter"/></svg>')
+        chevron_right_path = write_private_file("chevron-right.svg",
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+            f'<path d="M10 7.5l4.5 4.5-4.5 4.5" fill="none" stroke="{muted}" stroke-width="1.6" '
+            'stroke-linecap="square" stroke-linejoin="miter"/></svg>')
 
         # Omarchy design language: corners follow Hyprland's rounding, controls
         # are outlined with translucent foreground, selection uses the accent

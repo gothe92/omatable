@@ -4,6 +4,11 @@ Omatable is listed in the Omarchy plugin marketplace, and maintainers review eve
 commit there for security. These rules come from that review. Follow them for any
 code that starts a process.
 
+**Read [`docs/security-lessons.md`](docs/security-lessons.md) before changing code that
+starts a process, builds a command, writes a file, or shows connection details.** It
+records every security bug found so far, why it mattered, and how to check it stays
+fixed. When a new one is found, add it there.
+
 ## Secrets never go in process arguments
 
 Arguments are visible to every user on the machine through `ps`. Passwords, tokens
@@ -52,6 +57,20 @@ contents, Redis commands and Mongo scripts.
 - SQL identifiers go through the engine's quoting helpers (backticks / double
   quotes / brackets with the closing character doubled). Values never get
   concatenated into SQL that runs unattended.
+
+## Untrusted values as options or addresses
+
+Database names and similar server data must never reach a CLI where they can be read
+as an option, connection string or address:
+- psql: always `-d` via `_pg_dbname()` (quoted `dbname='…'`), because a bare value
+  containing `=` is a conninfo string.
+- mongosh: no positional database argument. Select it in the script from `process.env`.
+
+## Files
+
+Never write to a fixed, guessable path in a shared directory such as `/tmp`. Use
+`private_dir()` and `write_private_file()` (`$XDG_RUNTIME_DIR`, 0700/0600, no symlink
+following).
 
 ## No privilege escalation
 
