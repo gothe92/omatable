@@ -4,6 +4,10 @@ A database browser for [Omarchy](https://omarchy.org). Browse your Docker databa
 
 ![Omatable browsing a PostgreSQL database](preview.png)
 
+[![Watch the 75-second demo](docs/demo/poster.png)](docs/demo/omatable-demo.mp4)
+
+PostgreSQL, MySQL, MongoDB and a SQLite file on four workspaces: keyboard navigation, the `Ctrl+P` quick switcher, a query with results, and the confirmation step before a change.
+
 ## Features
 
 - **Your containers, ready to browse.** Finds supported Docker databases and reads their connection details from the containers. Works with Docker Compose and Omarchy's database containers.
