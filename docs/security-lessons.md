@@ -70,7 +70,7 @@ file, or shows connection details. The short rules are in [`AGENTS.md`](../AGENT
 
 ## 6. Database names read as a connection string by `psql`
 
-- **Found by:** our audit, after #5. Fixed in the commit that added this file.
+- **Found by:** our audit, after #5. Fixed in `4c3536a`.
 - **What:** `psql -d <name>`. psql treats a `-d` value containing `=` as a conninfo string.
 - **Why it's bad:** database names are server data. A database named
   `dbname=coffee_roastery` really made psql connect to `coffee_roastery`, and a name
@@ -81,7 +81,7 @@ file, or shows connection details. The short rules are in [`AGENTS.md`](../AGENT
 
 ## 7. Database name as mongosh's positional argument
 
-- **Found by:** our audit. Fixed in the commit that added this file.
+- **Found by:** our audit. Fixed in `4c3536a`.
 - **What:** the terminal ran `mongosh <dbname>`. The positional argument is a connection
   address, not just a database name.
 - **Fix:** connect with no positional argument, then select the database in the script
@@ -89,7 +89,7 @@ file, or shows connection details. The short rules are in [`AGENTS.md`](../AGENT
 
 ## 8. Fixed file names in the shared `/tmp`
 
-- **Found by:** our audit. Fixed in the commit that added this file.
+- **Found by:** our audit. Fixed in `4c3536a`.
 - **What:** the arrow icons were written to `/tmp/omatable-chevron-<uid>.svg`.
 - **Why it's bad:** another local user can create or replace a guessable file in `/tmp`
   first, either a symlink pointing at one of our files or a file whose content they
