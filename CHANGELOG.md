@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.1 — 2026-10-20
+
+### Security
+
+- Database names in psql now always use quoted conninfo syntax (`dbname='…'`), preventing a malicious database name containing `=` from being parsed as a connection string.
+- mongosh terminal no longer accepts a positional database argument; the database is selected from the environment inside the script.
+- Icon temp files are now written to `$XDG_RUNTIME_DIR/omatable` with secure permissions (0700/0600, O_NOFOLLOW) instead of predictable paths in `/tmp`.
+
+### Fixed
+
+- Database loads that are already running are no longer restarted on every keystroke or finished load, eliminating redundant parallel queries that delayed the table the user wanted to open.
+
+### Documentation
+
+- Added a demo video to the README.
+- Added `docs/security-lessons.md` documenting all security issues found during marketplace review.
+
 ## 1.0.0 — 2026-10-19
 
 First release.

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "gothe92.omatable",
   "name": "Omatable",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Andras",
   "license": "MIT",
   "description": "Database browser for Omarchy: auto-discovers PostgreSQL, MySQL, MariaDB, MSSQL, MongoDB and Redis containers in Docker and opens SQLite files.",
