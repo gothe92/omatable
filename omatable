@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -181,6 +182,13 @@ class DockerDbContainer:
         return badges.get(self.engine, "🗄️ DB")
 
     @property
+    def display_url(self) -> str:
+        """connection_url with the password masked, for on-screen messages."""
+        if not self.password:
+            return self.connection_url
+        return self.connection_url.replace(f":{self.password}@", ":•••@", 1)
+
+    @property
     def connection_url(self) -> str:
         if self.engine == "sqlite":
             return f"sqlite:///{self.default_db}"
@@ -260,17 +268,67 @@ def is_write_query(engine: str, query: str) -> bool:
 
 
 class DockerDbBackend:
+    # mongosh logs in from inside its script, reading these from its environment
+    MONGO_AUTH_JS = (
+        "if (process.env.OMATABLE_MONGO_USER) { db.getSiblingDB('admin').auth("
+        "process.env.OMATABLE_MONGO_USER, process.env.OMATABLE_MONGO_PASS); }\n"
+    )
+
     def __init__(self):
         # Why the last container scan failed (no Docker, no permission), shown in the UI
         self.docker_error = ""
+        self._secrets_by_container: Dict[str, Dict[str, str]] = {}
 
-    def run_docker(self, args: List[str], timeout: int = 12) -> Tuple[int, str, str]:
+    @staticmethod
+    def secret_env(c: DockerDbContainer) -> Dict[str, str]:
+        """Credentials for a container's CLI, as environment variables."""
+        if c.engine in ("mysql", "mariadb"):
+            env = {"MYSQL_PWD": c.password}
+        elif c.engine == "postgres":
+            env = {"PGPASSWORD": c.password}
+        elif c.engine == "redis":
+            env = {"REDISCLI_AUTH": c.password}
+        elif c.engine == "mssql":
+            env = {"SQLCMDPASSWORD": c.password}
+        elif c.engine == "mongodb":
+            env = {"OMATABLE_MONGO_USER": c.user, "OMATABLE_MONGO_PASS": c.password} if c.user else {}
+        else:
+            env = {}
+        return {k: v for k, v in env.items() if v}
+
+    def _secret_flags(self, c: DockerDbContainer) -> List[str]:
+        """`-e NAME` flags for docker exec. Docker takes each value from its own
+        environment, so passwords never appear in any process's arguments."""
+        env = self.secret_env(c)
+        self._secrets_by_container[c.name] = env
+        flags: List[str] = []
+        for name in env:
+            flags += ["-e", name]
+        return flags
+
+    @staticmethod
+    def _exec_target(args: List[str]) -> str:
+        """Container name in a `docker exec [options] CONTAINER ...` argument list."""
+        i = 1
+        while i < len(args) and args[i].startswith("-"):
+            i += 2 if args[i] in ("-e", "--env", "-u", "--user", "-w", "--workdir") else 1
+        return args[i] if i < len(args) else ""
+
+    def run_docker(self, args: List[str], timeout: int = 12,
+                   env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
+        run_env = None
+        secrets = dict(env or {})
+        if args and args[0] == "exec":
+            secrets = {**self._secrets_by_container.get(self._exec_target(args), {}), **secrets}
+        if secrets:
+            run_env = {**os.environ, **secrets}
         try:
             proc = subprocess.run(
                 ["docker"] + args,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=run_env,
             )
             return proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired:
@@ -544,9 +602,7 @@ class DockerDbBackend:
 
     def _mysql_exec_args(self, c: DockerDbContainer, db: str = "", batch: bool = True) -> List[str]:
         bin_name = "mariadb" if c.engine == "mariadb" else "mysql"
-        args = ["exec"]
-        if c.password:
-            args += ["-e", f"MYSQL_PWD={c.password}"]
+        args = ["exec", *self._secret_flags(c)]
         args += [c.name, bin_name, "-u", c.user or "root", "--default-character-set=utf8mb4"]
         if batch:
             args += ["-B"]
@@ -557,9 +613,7 @@ class DockerDbBackend:
         return args
 
     def _pg_exec_args(self, c: DockerDbContainer, db: str = "") -> List[str]:
-        args = ["exec"]
-        if c.password:
-            args += ["-e", f"PGPASSWORD={c.password}"]
+        args = ["exec", *self._secret_flags(c)]
         args += [c.name, "psql", "-U", c.user or "postgres", "-d", db or c.default_db or "postgres", "-P", "pager=off"]
         return args
 
@@ -572,7 +626,7 @@ class DockerDbBackend:
                 "ls /opt/mssql-tools18/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd 2>/dev/null | head -1",
             ])
             self._sqlcmd_paths[c.name] = out.strip() or "/opt/mssql-tools18/bin/sqlcmd"
-        args = ["exec", "-e", f"SQLCMDPASSWORD={c.password}", c.name, self._sqlcmd_paths[c.name],
+        args = ["exec", *self._secret_flags(c), c.name, self._sqlcmd_paths[c.name],
                 "-C", "-S", "localhost", "-U", c.user or "sa", "-d", db or c.default_db or "master",
                 "-W", "-s", "\t", "-b"]
         if not headers:
@@ -587,9 +641,7 @@ class DockerDbBackend:
         return (lines[0].split("\t"), [l.split("\t") for l in lines[2:]])
 
     def _redis_exec_args(self, c: DockerDbContainer, db: str = "0") -> List[str]:
-        args = ["exec"]
-        if c.password:
-            args += ["-e", f"REDISCLI_AUTH={c.password}"]
+        args = ["exec", *self._secret_flags(c)]
         args += [c.name, "redis-cli", "-n", db if db.isdigit() else "0"]
         return args
 
@@ -690,10 +742,7 @@ class DockerDbBackend:
               printf "KEY\\t%s\\t%s\\t%s\\n" "$k" "$t" "$ttl"
             done
             """
-            exec_args = ["exec"]
-            if c.password:
-                exec_args += ["-e", f"REDISCLI_AUTH={c.password}"]
-            exec_args += [c.name, "sh", "-c", sh_script]
+            exec_args = ["exec", *self._secret_flags(c), c.name, "sh", "-c", sh_script]
             rc, out, err = self.run_docker(exec_args)
             if rc != 0:
                 return (active_db, dbs, [], f"Redis error: {err.strip()}")
@@ -714,12 +763,12 @@ class DockerDbBackend:
             return (active_db, dbs, items, summary)
 
         if c.engine == "mongodb":
-            auth_args = ["-u", c.user, "-p", c.password, "--authenticationDatabase", "admin"] if c.user else []
-            js = f"""
+            auth_args = self._secret_flags(c)
+            js = self.MONGO_AUTH_JS + f"""
             const dbs = db.adminCommand({{ listDatabases: 1 }}).databases.map(d => d.name);
-            const active = {json.dumps(selected_db or c.default_db or "admin")};
+            const active = process.env.OMATABLE_DB;
             const userDbs = dbs.filter(d => !["admin", "config", "local"].includes(d));
-            const explicit = {json.dumps(bool(selected_db))};
+            const explicit = process.env.OMATABLE_EXPLICIT === "1";
             const target = dbs.includes(active) && (explicit || userDbs.length === 0 || userDbs.includes(active))
               ? active : (userDbs[0] || dbs[0] || "admin");
             const cur = db.getSiblingDB(target);
@@ -730,7 +779,10 @@ class DockerDbBackend:
             }}));
             print(JSON.stringify({{ activeDb: target, databases: dbs, items }}));
             """
-            rc, out, err = self.run_docker(["exec", c.name, "mongosh", "--quiet"] + auth_args + ["--eval", js])
+            rc, out, err = self.run_docker(
+                ["exec", *auth_args, "-e", "OMATABLE_DB", "-e", "OMATABLE_EXPLICIT", c.name, "mongosh", "--quiet", "--eval", js],
+                env={"OMATABLE_DB": selected_db or c.default_db or "admin", "OMATABLE_EXPLICIT": "1" if selected_db else "0"},
+            )
             if rc != 0:
                 return ("admin", ["admin"], [], f"MongoDB error: {err.strip()}")
             try:
@@ -810,8 +862,10 @@ class DockerDbBackend:
             return (reader[0], reader[1:], out)
 
         if c.engine == "redis":
+            # The key comes from the database, so it is passed as data (env), never as shell code
+            db = db if db.isdigit() else "0"
             sh_script = f"""
-            k={json.dumps(table_or_key)}
+            k="$OMATABLE_KEY"
             t=$(redis-cli -n {db} TYPE "$k" | tr -d '\\r')
             ttl=$(redis-cli -n {db} TTL "$k" | tr -d '\\r')
             printf "TYPE=%s\\nTTL=%s\\n" "$t" "$ttl"
@@ -824,11 +878,8 @@ class DockerDbBackend:
               *)      redis-cli -n {db} DUMP "$k" ;;
             esac
             """
-            exec_args = ["exec"]
-            if c.password:
-                exec_args += ["-e", f"REDISCLI_AUTH={c.password}"]
-            exec_args += [c.name, "sh", "-c", sh_script]
-            rc, out, err = self.run_docker(exec_args)
+            exec_args = ["exec", *self._secret_flags(c), "-e", "OMATABLE_KEY", c.name, "sh", "-c", sh_script]
+            rc, out, err = self.run_docker(exec_args, env={"OMATABLE_KEY": table_or_key})
             if rc != 0:
                 return (["Error"], [[err.strip()]], err.strip())
             lines = out.splitlines()
@@ -857,12 +908,16 @@ class DockerDbBackend:
             return (["Key", "Type", "TTL", "Value"], [[table_or_key, k_type, k_ttl, full_val]], full_val)
 
         if c.engine == "mongodb":
-            auth_args = ["-u", c.user, "-p", c.password, "--authenticationDatabase", "admin"] if c.user else []
-            js = f"""
-            const docs = db.getSiblingDB({json.dumps(db)}).getCollection({json.dumps(table_or_key)}).find({{}}).limit({int(limit)}).toArray();
+            auth_args = self._secret_flags(c)
+            js = self.MONGO_AUTH_JS + f"""
+            const docs = db.getSiblingDB(process.env.OMATABLE_DB).getCollection(process.env.OMATABLE_COLL)
+              .find({{}}).limit({int(limit)}).toArray();
             print(EJSON.stringify(docs, null, 2));
             """
-            rc, out, err = self.run_docker(["exec", c.name, "mongosh", "--quiet"] + auth_args + ["--eval", js])
+            rc, out, err = self.run_docker(
+                ["exec", *auth_args, "-e", "OMATABLE_DB", "-e", "OMATABLE_COLL", c.name, "mongosh", "--quiet", "--eval", js],
+                env={"OMATABLE_DB": db, "OMATABLE_COLL": table_or_key},
+            )
             if rc != 0:
                 return (["Error"], [[err.strip()]], err.strip())
             try:
@@ -997,25 +1052,28 @@ class DockerDbBackend:
             return (["Result"], [[out.strip() or f"OK ({elapsed})"]], out)
 
         if c.engine == "redis":
-            exec_args = ["exec", "-e", f"REDIS_CMD={query}"]
-            if c.password:
-                exec_args += ["-e", f"REDISCLI_AUTH={c.password}"]
-            exec_args += [c.name, "sh", "-c", f'eval "redis-cli -n {db if db.isdigit() else 0} $REDIS_CMD"']
-            rc, out, err = self.run_docker(exec_args, timeout=20)
+            try:
+                words = shlex.split(query)
+            except ValueError as e:
+                return (["Error"], [[f"Can't parse command: {e}"]], str(e))
+            rc, out, err = self.run_docker(self._redis_exec_args(c, db) + words, timeout=20)
             elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
             text = (out or err).strip()
             rows = [[str(i + 1), line] for i, line in enumerate(text.splitlines())]
             return (["#", f"Output ({elapsed})"], rows, text)
 
         if c.engine == "mongodb":
-            auth_args = ["-u", c.user, "-p", c.password, "--authenticationDatabase", "admin"] if c.user else []
-            js = f"""
-            const targetDb = db.getSiblingDB({json.dumps(db or "admin")});
-            const res = (function(db) {{ return eval({json.dumps(query)}); }})(targetDb);
+            auth_args = self._secret_flags(c)
+            js = self.MONGO_AUTH_JS + f"""
+            const targetDb = db.getSiblingDB(process.env.OMATABLE_DB);
+            const res = (function(db) {{ return eval(process.env.OMATABLE_QUERY); }})(targetDb);
             if (res && typeof res.toArray === 'function') print(EJSON.stringify(res.toArray(), null, 2));
             else print(EJSON.stringify(res, null, 2));
             """
-            rc, out, err = self.run_docker(["exec", c.name, "mongosh", "--quiet"] + auth_args + ["--eval", js], timeout=30)
+            rc, out, err = self.run_docker(
+                ["exec", *auth_args, "-e", "OMATABLE_DB", "-e", "OMATABLE_QUERY", c.name, "mongosh", "--quiet", "--eval", js],
+                timeout=30, env={"OMATABLE_DB": db or "admin", "OMATABLE_QUERY": query},
+            )
             text = (out or err).strip()
             return (["MongoDB Output"], [[text]], text)
 
@@ -1032,40 +1090,37 @@ class DockerDbBackend:
         return (["Output"], [["Unsupported engine"]], "")
 
     def open_interactive_terminal(self, c: DockerDbContainer, db: str = ""):
-        if c.engine == "sqlite":
-            subprocess.Popen(
-                ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal",
-                 "sqlite3", c.default_db],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return
-        prefix = "docker"
+        """Open the engine's own CLI in a terminal. Arguments are passed as a list (no
+        shell), and credentials only through the environment."""
         target_db = db or c.default_db
-        if c.engine in ("mysql", "mariadb"):
-            bin_name = "mariadb" if c.engine == "mariadb" else "mysql"
-            pw_env = f"-e MYSQL_PWD={json.dumps(c.password)} " if c.password else ""
-            cmd = f"{prefix} exec -it {pw_env}{c.name} {bin_name} -u {c.user or 'root'} {target_db}"
-        elif c.engine == "postgres":
-            pw_env = f"-e PGPASSWORD={json.dumps(c.password)} " if c.password else ""
-            cmd = f"{prefix} exec -it {pw_env}{c.name} psql -U {c.user or 'postgres'} -d {target_db or 'postgres'}"
-        elif c.engine == "redis":
-            pw_env = f"-e REDISCLI_AUTH={json.dumps(c.password)} " if c.password else ""
-            cmd = f"{prefix} exec -it {pw_env}{c.name} redis-cli -n {target_db if target_db.isdigit() else '0'}"
-        elif c.engine == "mongodb":
-            auth = f"-u {c.user} -p {json.dumps(c.password)} --authenticationDatabase admin" if c.user else ""
-            cmd = f"{prefix} exec -it {c.name} mongosh {auth} {target_db or 'admin'}"
+        if c.engine == "sqlite":
+            argv = ["sqlite3", c.default_db]
+            env: Dict[str, str] = {}
         else:
-            cmd = f"{prefix} exec -it {c.name} sh"
-        if c.engine == "mssql":
-            sqlcmd = self._mssql_exec_args(c, target_db)[4]
-            cmd = (f"{prefix} exec -it -e SQLCMDPASSWORD={json.dumps(c.password)} {c.name} {sqlcmd} "
-                   f"-C -S localhost -U {c.user or 'sa'} -d {target_db or 'master'}")
+            env = self.secret_env(c)
+            argv = ["docker", "exec", "-it", *self._secret_flags(c), c.name]
+            if c.engine in ("mysql", "mariadb"):
+                argv += ["mariadb" if c.engine == "mariadb" else "mysql", "-u", c.user or "root"]
+                if target_db:
+                    argv += ["-D", target_db]
+            elif c.engine == "postgres":
+                argv += ["psql", "-U", c.user or "postgres", "-d", target_db or "postgres"]
+            elif c.engine == "redis":
+                argv += ["redis-cli", "-n", target_db if target_db.isdigit() else "0"]
+            elif c.engine == "mongodb":
+                argv += ["mongosh", target_db or "admin", "--quiet", "--eval", self.MONGO_AUTH_JS, "--shell"]
+            elif c.engine == "mssql":
+                self._mssql_exec_args(c, target_db)  # resolves the sqlcmd path
+                argv += [self._sqlcmd_paths[c.name], "-C", "-S", "localhost", "-U", c.user or "sa",
+                         "-d", target_db or "master"]
+            else:
+                argv += ["sh"]
 
         subprocess.Popen(
-            ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal", "bash", "-lc", cmd],
+            ["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--app-id=org.omarchy.terminal", *argv],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env={**os.environ, **env},
         )
 
 
@@ -1908,7 +1963,7 @@ class OmatableWindow(QMainWindow):
             self.current_db = active_db
             self.current_items = items
             self._build_schema_tree(c, dbs, active_db, items)
-            self.status_bar.showMessage(f"Connected to {c.name}  •  {summary}  •  {c.connection_url}")
+            self.status_bar.showMessage(f"Connected to {c.name}  •  {summary}  •  {c.display_url}")
 
         self._run_async(f"Connecting to {c.name} ({c.engine_label})...", _task, _done, channel="schema")
 
@@ -2594,7 +2649,7 @@ class OmatableWindow(QMainWindow):
             return
         url = self.current_container.connection_url
         QGuiApplication.clipboard().setText(url)
-        self.status_bar.showMessage(f"Copied connection URL to clipboard: {url}")
+        self.status_bar.showMessage(f"Copied connection URL to clipboard: {self.current_container.display_url}")
 
     def copy_table_as_json(self):
         if not self.current_headers or not self.current_rows:
