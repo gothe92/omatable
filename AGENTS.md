@@ -21,6 +21,21 @@ whether ours, `docker`'s, or a CLI's inside the container.
 - Never show a password on screen: use `display_url`, not `connection_url`, in
   messages. `connection_url` is only for the explicit Copy URL action.
 
+## User-written text never goes in process arguments either
+
+Anything the user types or pastes can hold a secret, for example
+`ALTER USER … PASSWORD '…'` or an `INSERT` with a token. That covers query editor
+contents, Redis commands and Mongo scripts.
+
+- Send it to the CLI on **stdin**: `run_docker(..., stdin=text)` adds `docker exec -i`.
+  MySQL/MariaDB, `psql` (with `-v ON_ERROR_STOP=1` so errors still exit non-zero),
+  `redis-cli` (one command per line) and `sqlcmd` (end with `GO`) all read stdin.
+- If stdin isn't possible, use an environment variable (`/proc/<pid>/environ` is
+  readable only by the same user), as the Mongo console does with `OMATABLE_QUERY`.
+- Never use `psql -c <query>`, `mysql -e <query>`, `sqlcmd -Q <query>`, or
+  `redis-cli <words…>` for user text. `-e`/`-Q` are fine only for fixed SQL that
+  Omatable itself builds and that contains no user input.
+
 ## No shell interpolation
 
 - Start processes with an argument list, never with `bash -c` / `sh -c` built from
@@ -52,7 +67,8 @@ Don't change the user's configuration without explicit consent. For example,
 
 - `omarchy plugin validate .` must pass.
 - Check that no secret appears in spawned argv. Wrap `subprocess.run` / `Popen` in a
-  test and search the joined argv for each container's password.
+  test and search the joined argv for each container's password, and for a
+  marker string placed in a console query.
 - Run any new process-spawning code against a key or table named
   `$(touch /tmp/pwned)` and confirm the file is not created.
 - After a fix requested in the marketplace issue, reply there with the full commit

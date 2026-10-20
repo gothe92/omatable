@@ -12,7 +12,6 @@ import io
 import json
 import os
 import re
-import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -315,7 +314,11 @@ class DockerDbBackend:
         return args[i] if i < len(args) else ""
 
     def run_docker(self, args: List[str], timeout: int = 12,
-                   env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
+                   env: Optional[Dict[str, str]] = None, stdin: Optional[str] = None) -> Tuple[int, str, str]:
+        """Run `docker <args>`. User-written text (queries) goes in through `stdin`,
+        never as an argument: arguments are readable by every local user."""
+        if stdin is not None and args and args[0] == "exec" and "-i" not in args:
+            args = ["exec", "-i", *args[1:]]
         run_env = None
         secrets = dict(env or {})
         if args and args[0] == "exec":
@@ -329,6 +332,7 @@ class DockerDbBackend:
                 text=True,
                 timeout=timeout,
                 env=run_env,
+                input=stdin,
             )
             return proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired:
@@ -1026,7 +1030,7 @@ class DockerDbBackend:
             elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
             return (headers, rows, f"-- {len(rows)} rows in {elapsed}" + (f"\n{raw}" if raw else ""))
         if c.engine in ("mysql", "mariadb"):
-            rc, out, err = self.run_docker(self._mysql_exec_args(c, db, batch=True) + ["-e", query], timeout=30)
+            rc, out, err = self.run_docker(self._mysql_exec_args(c, db, batch=True), timeout=30, stdin=query + "\n")
             elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
             if rc != 0:
                 return (["Error"], [[err.strip() or out.strip()]], f"ERROR ({elapsed}):\n{err.strip() or out.strip()}")
@@ -1038,25 +1042,22 @@ class DockerDbBackend:
             return (headers, rows, f"-- {len(rows)} rows in {elapsed}\n{out}")
 
         if c.engine == "postgres":
-            rc, out, err = self.run_docker(self._pg_exec_args(c, db) + ["-F", "\t", "-A", "-c", query], timeout=30)
+            rc, out, err = self.run_docker(self._pg_exec_args(c, db) + ["-F", "\t", "-A", "-v", "ON_ERROR_STOP=1"],
+                                           timeout=30, stdin=query + "\n")
             elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
             if rc != 0:
                 return (["Error"], [[err.strip() or out.strip()]], f"ERROR ({elapsed}):\n{err.strip() or out.strip()}")
             lines = out.splitlines()
-            if len(lines) >= 2 and "\t" in lines[0]:
+            # A result set in psql -A ends with "(N rows)"; one-column results have no tab
+            if len(lines) >= 2 and re.fullmatch(r"\(\d+ rows?\)", lines[-1]):
                 headers = lines[0].split("\t")
-                # Last line in psql -A is "(N rows)"
-                body = lines[1:-1] if lines[-1].startswith("(") else lines[1:]
-                rows = [l.split("\t") for l in body]
+                rows = [l.split("\t") for l in lines[1:-1]]
                 return (headers, rows, f"-- {elapsed}\n{out}")
             return (["Result"], [[out.strip() or f"OK ({elapsed})"]], out)
 
         if c.engine == "redis":
-            try:
-                words = shlex.split(query)
-            except ValueError as e:
-                return (["Error"], [[f"Can't parse command: {e}"]], str(e))
-            rc, out, err = self.run_docker(self._redis_exec_args(c, db) + words, timeout=20)
+            # redis-cli reads one command per line from stdin and parses the quoting itself
+            rc, out, err = self.run_docker(self._redis_exec_args(c, db), timeout=20, stdin=query + "\n")
             elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
             text = (out or err).strip()
             rows = [[str(i + 1), line] for i, line in enumerate(text.splitlines())]
@@ -1078,7 +1079,8 @@ class DockerDbBackend:
             return (["MongoDB Output"], [[text]], text)
 
         if c.engine == "mssql":
-            rc, out, err = self.run_docker(self._mssql_exec_args(c, db) + ["-Q", "SET NOCOUNT ON; " + query], timeout=30)
+            rc, out, err = self.run_docker(self._mssql_exec_args(c, db), timeout=30,
+                                           stdin="SET NOCOUNT ON;\nGO\n" + query + "\nGO\n")
             elapsed = f"{(time.monotonic() - t0)*1000:.1f} ms"
             if rc != 0:
                 return (["Error"], [[(err or out).strip()]], f"ERROR ({elapsed}):\n{(err or out).strip()}")
