@@ -125,6 +125,25 @@ file, or shows connection details. The short rules are in [`AGENTS.md`](../AGENT
 - **Fix:** a plain install only adds Omatable to "Open with". `--default-sqlite` opts in.
   Uninstall removes only Omatable's own entries.
 
+## 12. SQLite view auto-count with infinite recursive CTE hangs the app
+
+- **Found by:** marketplace reviewer (HANCORE-linux), at `ba8b622`. Fixed in this commit.
+- **What:** `_sqlite_list()` ran `SELECT COUNT(*)` on every table and view automatically.
+  A malicious DB with a view built on an infinite recursive CTE (e.g.
+  `CREATE VIEW evil AS WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r) SELECT x FROM r`)
+  would make the worker run forever; `closeEvent` waited on the worker, so the app hung.
+- **Why it's bad:** denial of service—opening a crafted SQLite file freezes the UI with no
+  way to cancel, and closing the window doesn't help.
+- **Fix:** views are no longer auto-counted; they show "?" and can be counted on demand via
+  context menu. All SQLite queries now use a progress handler with a VM-step limit
+  (`SQLITE_STEP_LIMIT`), which interrupts long-running queries. `closeEvent` calls
+  `backend.interrupt_sqlite()` before waiting, and terminates workers that don't finish
+  within 2 seconds.
+- **Check:** create `evil.db` with
+  `CREATE VIEW evil AS WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r) SELECT x FROM r;`
+  and open it. The view must show "?", not spin, and closing the window must be instant.
+  Selecting the view and running a query that reads it must fail within seconds, not hang.
+
 ---
 
 ## Review checklist for new code

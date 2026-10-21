@@ -310,10 +310,19 @@ class DockerDbBackend:
         "process.env.OMATABLE_MONGO_USER, process.env.OMATABLE_MONGO_PASS); }\n"
     )
 
+    # VM-step limit for SQLite progress handler: check every N VM instructions
+    SQLITE_STEP_LIMIT = 50_000
+    # Time limit for SQLite queries in seconds
+    SQLITE_TIMEOUT = 5.0
+
     def __init__(self):
         # Why the last container scan failed (no Docker, no permission), shown in the UI
         self.docker_error = ""
         self._secrets_by_container: Dict[str, Dict[str, str]] = {}
+        # Track active SQLite connections so closeEvent can interrupt them
+        self._sqlite_conns: List[sqlite3.Connection] = []
+        self._sqlite_interrupted = False
+        self._sqlite_query_start: float = 0.0
 
     @staticmethod
     def secret_env(c: DockerDbContainer) -> Dict[str, str]:
@@ -596,6 +605,42 @@ class DockerDbBackend:
     def _sqlite_ident(name: str) -> str:
         return '"' + name.replace('"', '""') + '"'
 
+    def interrupt_sqlite(self):
+        """Interrupt all tracked SQLite connections (called from closeEvent)."""
+        self._sqlite_interrupted = True
+        for conn in list(self._sqlite_conns):
+            try:
+                conn.interrupt()
+            except Exception:
+                pass
+
+    def _sqlite_progress_handler(self) -> int:
+        """Progress callback: return non-zero to abort the query."""
+        if self._sqlite_interrupted:
+            return 1
+        if self._sqlite_query_start and (time.monotonic() - self._sqlite_query_start) > self.SQLITE_TIMEOUT:
+            return 1
+        return 0
+
+    def _sqlite_connect(self, path: str) -> sqlite3.Connection:
+        """Open a tracked, interruptible SQLite connection with timeout."""
+        self._sqlite_query_start = time.monotonic()
+        conn = sqlite3.connect(path)
+        conn.set_progress_handler(self._sqlite_progress_handler, self.SQLITE_STEP_LIMIT)
+        self._sqlite_conns.append(conn)
+        return conn
+
+    def _sqlite_close(self, conn: sqlite3.Connection):
+        """Close and untrack a SQLite connection."""
+        try:
+            self._sqlite_conns.remove(conn)
+        except ValueError:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     def _sqlite_list(self, c: DockerDbContainer) -> Tuple[str, List[str], List[Dict[str, str]], str]:
         try:
             with sqlite3.connect(c.default_db) as conn:
@@ -605,17 +650,43 @@ class DockerDbBackend:
                 ).fetchall()
                 items = []
                 for name, kind in objs:
-                    try:
-                        n = conn.execute(f"SELECT COUNT(*) FROM {self._sqlite_ident(name)}").fetchone()[0]
-                    except sqlite3.Error:
-                        n = "?"
-                    items.append({"name": name, "count": f"{n} rows", "extra": kind})
+                    if kind == "view":
+                        items.append({"name": name, "count": "? rows", "extra": "view"})
+                    else:
+                        try:
+                            n = conn.execute(f"SELECT COUNT(*) FROM {self._sqlite_ident(name)}").fetchone()[0]
+                        except sqlite3.Error:
+                            n = "?"
+                        items.append({"name": name, "count": f"{n} rows", "extra": kind})
         except sqlite3.Error as e:
             return (c.name, [c.name], [], f"SQLite error: {e}")
-        return (c.name, [c.name], items, f"{len(items)} tables in `{c.name}`")
+        n_tables = sum(1 for it in items if it.get("extra") != "view")
+        n_views = len(items) - n_tables
+        summary = f"{n_tables} tables" + (f", {n_views} views" if n_views else "") + f" in `{c.name}`"
+        return (c.name, [c.name], items, summary)
+
+    def sqlite_count_item(self, c: DockerDbContainer, name: str) -> Tuple[Optional[int], str]:
+        """Count rows of a single table/view with interruption and timeout.
+        Returns (count, error_message). count is None on error."""
+        self._sqlite_interrupted = False
+        conn = self._sqlite_connect(c.default_db)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT COUNT(*) FROM {self._sqlite_ident(name)}")
+            row = cur.fetchone()
+            return (row[0] if row else 0, "")
+        except sqlite3.OperationalError as e:
+            if "interrupt" in str(e).lower():
+                return (None, "Query interrupted (too slow or app closing)")
+            return (None, str(e))
+        except sqlite3.Error as e:
+            return (None, str(e))
+        finally:
+            self._sqlite_close(conn)
 
     def _sqlite_run(self, c: DockerDbContainer, sql: str, params: Tuple = ()) -> Tuple[List[str], List[List[str]], str]:
-        conn = sqlite3.connect(c.default_db)
+        self._sqlite_interrupted = False
+        conn = self._sqlite_connect(c.default_db)
         try:
             cur = conn.cursor()
             try:
@@ -631,8 +702,12 @@ class DockerDbBackend:
             conn.commit()
             affected = cur.rowcount if cur.rowcount >= 0 else 0
             return (["Status"], [[f"OK, {affected} row(s) affected"]], f"{affected} row(s) affected")
+        except sqlite3.OperationalError as e:
+            if "interrupt" in str(e).lower():
+                raise sqlite3.Error("Query interrupted (too slow or cancelled)")
+            raise
         finally:
-            conn.close()
+            self._sqlite_close(conn)
 
     def toggle_container(self, c: DockerDbContainer) -> Tuple[bool, str]:
         if c.engine == "sqlite":
@@ -1650,6 +1725,8 @@ class OmatableWindow(QMainWindow):
         self.schema_tree.setExpandsOnDoubleClick(True)
         self.schema_tree.currentItemChanged.connect(self.on_tree_current_changed)
         self.schema_tree.itemExpanded.connect(self.on_tree_expanded)
+        self.schema_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.schema_tree.customContextMenuRequested.connect(self.show_schema_tree_menu)
         l2.addWidget(self.schema_tree)
         sidebar.addWidget(pane_schema)
         sidebar.setSizes([260, 520])
@@ -1893,8 +1970,11 @@ class OmatableWindow(QMainWindow):
         worker.start()
 
     def closeEvent(self, event):
+        self.backend.interrupt_sqlite()
         for worker in list(self._alive_threads):
-            worker.wait(15000)
+            if not worker.wait(2000):
+                worker.terminate()
+                worker.wait(500)
         super().closeEvent(event)
 
     # -----------------------------------------------------------------------
@@ -2640,6 +2720,47 @@ class OmatableWindow(QMainWindow):
         btn_cancel.setDefault(True)
         btn_cancel.setFocus()
         return dlg.exec() == QDialog.DialogCode.Accepted
+
+    def show_schema_tree_menu(self, pos):
+        item = self.schema_tree.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(0, self._ROLE) or ("",)
+        if data[0] != "table" or not self.current_container:
+            return
+        c = self.current_container
+        db, name = data[1], data[2]
+        items = self._db_items.get(db, [])
+        item_info = next((it for it in items if it.get("name") == name), None)
+        is_view = item_info and item_info.get("extra") == "view"
+        is_uncounted = item_info and item_info.get("count", "").startswith("?")
+
+        menu = QMenu(self)
+        if c.engine == "sqlite" and is_view and is_uncounted:
+            menu.addAction("Count rows…", lambda: self._count_sqlite_view(c, db, name))
+        menu.addAction("Reload", lambda: self.refresh_database(db))
+        if not menu.isEmpty():
+            menu.exec(self.schema_tree.viewport().mapToGlobal(pos))
+
+    def _count_sqlite_view(self, c: DockerDbContainer, db: str, name: str):
+        """Count rows of a SQLite view on demand (with timeout protection)."""
+        def _task():
+            return self.backend.sqlite_count_item(c, name)
+
+        def _done(res):
+            count, err = res
+            if err:
+                self.status_bar.showMessage(f"Count failed: {err}")
+                return
+            items = self._db_items.get(db, [])
+            for it in items:
+                if it.get("name") == name:
+                    it["count"] = f"{count} rows"
+                    break
+            self._show_db_overview(db)
+            self.status_bar.showMessage(f"{name}: {count} rows")
+
+        self._run_async(f"Counting {name}…", _task, _done)
 
     def show_container_menu(self, pos):
         menu = QMenu(self)
