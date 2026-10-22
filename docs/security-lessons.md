@@ -144,6 +144,24 @@ file, or shows connection details. The short rules are in [`AGENTS.md`](../AGENT
   and open it. The view must show "?", not spin, and closing the window must be instant.
   Selecting the view and running a query that reads it must fail within seconds, not hang.
 
+## 13. FTS5 virtual table with infinite content view bypassed the progress handler
+
+- **Found by:** marketplace reviewer (static review), at `2bf6638`. Fixed in this commit.
+- **What:** `_sqlite_list()` used a raw `sqlite3.connect()` without the progress handler,
+  and auto-counted virtual tables (FTS3/4/5, rtree, any module) as if they were ordinary
+  tables. An FTS5 virtual table with an infinite recursive-CTE view as external content
+  (e.g. `CREATE VIRTUAL TABLE f USING fts5(a, content='v', content_rowid='rowid')` where
+  `v` is `CREATE VIEW v AS WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r) SELECT x AS a FROM r`)
+  made `COUNT(*)` run forever because SQLite forwards non-MATCH scans to the content view.
+- **Why it's bad:** same denial of service as #12, but bypassing the fix by using an
+  untracked connection and exploiting virtual table content forwarding.
+- **Fix:** all SQLite connections now go through `_sqlite_connect()`, which installs the
+  progress handler and timeout. Virtual tables (detected by `sql` starting with
+  `CREATE VIRTUAL TABLE`) are no longer auto-counted; they show "?" like views and can be
+  counted on demand via context menu.
+- **Check:** run `tests/test_sqlite_fts5_dos.py`. Opening/listing must return instantly,
+  manual count must time out with an error, and closing must be prompt.
+
 ---
 
 ## Review checklist for new code
