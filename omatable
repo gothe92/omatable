@@ -642,27 +642,48 @@ class DockerDbBackend:
             pass
 
     def _sqlite_list(self, c: DockerDbContainer) -> Tuple[str, List[str], List[Dict[str, str]], str]:
+        self._sqlite_interrupted = False
+        conn = self._sqlite_connect(c.default_db)
         try:
-            with sqlite3.connect(c.default_db) as conn:
-                objs = conn.execute(
-                    "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') "
-                    "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-                ).fetchall()
-                items = []
-                for name, kind in objs:
-                    if kind == "view":
-                        items.append({"name": name, "count": "? rows", "extra": "view"})
-                    else:
-                        try:
-                            n = conn.execute(f"SELECT COUNT(*) FROM {self._sqlite_ident(name)}").fetchone()[0]
-                        except sqlite3.Error:
-                            n = "?"
-                        items.append({"name": name, "count": f"{n} rows", "extra": kind})
+            objs = conn.execute(
+                "SELECT name, type, sql FROM sqlite_master WHERE type IN ('table', 'view') "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            items = []
+            for name, kind, sql in objs:
+                is_virtual = kind == "table" and sql and sql.upper().startswith("CREATE VIRTUAL TABLE")
+                if kind == "view" or is_virtual:
+                    extra = "view" if kind == "view" else "virtual"
+                    items.append({"name": name, "count": "? rows", "extra": extra})
+                else:
+                    try:
+                        n = conn.execute(f"SELECT COUNT(*) FROM {self._sqlite_ident(name)}").fetchone()[0]
+                    except sqlite3.OperationalError as e:
+                        if "interrupt" in str(e).lower():
+                            return (c.name, [c.name], [], "Query interrupted (too slow or app closing)")
+                        n = "?"
+                    except sqlite3.Error:
+                        n = "?"
+                    items.append({"name": name, "count": f"{n} rows", "extra": kind})
+        except sqlite3.OperationalError as e:
+            if "interrupt" in str(e).lower():
+                return (c.name, [c.name], [], "Query interrupted (too slow or app closing)")
+            return (c.name, [c.name], [], f"SQLite error: {e}")
         except sqlite3.Error as e:
             return (c.name, [c.name], [], f"SQLite error: {e}")
-        n_tables = sum(1 for it in items if it.get("extra") != "view")
-        n_views = len(items) - n_tables
-        summary = f"{n_tables} tables" + (f", {n_views} views" if n_views else "") + f" in `{c.name}`"
+        finally:
+            self._sqlite_close(conn)
+        n_tables = sum(1 for it in items if it.get("extra") == "table")
+        n_views = sum(1 for it in items if it.get("extra") == "view")
+        n_virtual = sum(1 for it in items if it.get("extra") == "virtual")
+        parts = []
+        if n_tables:
+            parts.append(f"{n_tables} tables")
+        if n_virtual:
+            parts.append(f"{n_virtual} virtual")
+        if n_views:
+            parts.append(f"{n_views} views")
+        summary = ", ".join(parts) + f" in `{c.name}`" if parts else f"Empty database `{c.name}`"
         return (c.name, [c.name], items, summary)
 
     def sqlite_count_item(self, c: DockerDbContainer, name: str) -> Tuple[Optional[int], str]:
@@ -2732,11 +2753,11 @@ class OmatableWindow(QMainWindow):
         db, name = data[1], data[2]
         items = self._db_items.get(db, [])
         item_info = next((it for it in items if it.get("name") == name), None)
-        is_view = item_info and item_info.get("extra") == "view"
+        is_deferred = item_info and item_info.get("extra") in ("view", "virtual")
         is_uncounted = item_info and item_info.get("count", "").startswith("?")
 
         menu = QMenu(self)
-        if c.engine == "sqlite" and is_view and is_uncounted:
+        if c.engine == "sqlite" and is_deferred and is_uncounted:
             menu.addAction("Count rows…", lambda: self._count_sqlite_view(c, db, name))
         menu.addAction("Reload", lambda: self.refresh_database(db))
         if not menu.isEmpty():
